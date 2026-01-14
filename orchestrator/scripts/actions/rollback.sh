@@ -19,8 +19,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIB_DIR="$(cd "$SCRIPT_DIR/../lib" && pwd)"
 
-# shellcheck source=../lib/common.sh
-source "$LIB_DIR/common.sh"
+# shellcheck source=../lib/utils.sh
+source "$LIB_DIR/utils.sh"
 
 DEFAULT_REMOTE_BASE="/sppmon"
 

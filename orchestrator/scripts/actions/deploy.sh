@@ -10,18 +10,20 @@ set -euo pipefail
 #
 # Simulation (no SSH):
 #   If --remote is NOT provided, all targets are deployed into:
-#     <repo>/host/<target><REMOTE_BASE>/
+#     <root>/hosts/<target><REMOTE_BASE>/
 #   Example (REMOTE_BASE=/sppmon):
-#     host/188.23.34.10/sppmon/{releases,volumes,current}
+#     hosts/188.23.34.10/sppmon/{releases,volumes,current}
 #
 # Remote mode (SSH):
 #   Explicitly enabled with --remote (kept as placeholder for now).
 # ------------------------------------------------------------------------------
 
+# shellcheck disable=SC2164
+# shellcheck disable=SC2164
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIB_DIR="$(cd "$SCRIPT_DIR/../lib" && pwd)"
-# shellcheck source=../lib/common.sh
-source "$LIB_DIR/common.sh"
+# shellcheck source=../lib/utils.sh
+source "$LIB_DIR/utils.sh"
 
 # ---- Defaults ----------------------------------------------------------------
 
@@ -37,30 +39,35 @@ TARGETS_RAW=""
 SERVICES_RAW=""
 ENABLE_REMOTE="false"
 STRICT_MODE="false"
+INVENTORY_DIR=""
+REPO_ROOT=""
+YQ_BIN=""
 
 print_help() {
   cat <<'EOF'
 deploy.sh - Build and deploy a release
 
 USAGE:
-  deploy.sh --root <path> --app <APP> --env <ENV> --targets <list> --services <list> [--remote] [--strict]
+  deploy.sh --root <path> --app <APP> --env <ENV> --targets <list> [--services <list>] [--remote] [--strict]
 
 REQUIRED:
   --root <path>        Repository root (passed by sppmon)
   --app <name>         Application name (ICOM, Jaguar, ...)
   --env <name>         Environment (UAT, PRD, ...)
   --targets <list>     Comma-separated targets (e.g. "188.23.34.10,188.23.34.11")
-  --services <list>    Comma-separated services to include (e.g. "alloy,loki_exporter")
 
 OPTIONAL:
   --remote             Enable SSH/SCP remote deployment (disabled by default)
   --strict             Fail build if any requested service template/binary is missing
+  --services <list>    Comma-separated services to include (overrides app defaults)
   --help               Show this help
 
 NOTES:
-  - If --remote is NOT provided, ALL targets are treated as local simulations under <repo>/host/<target>/...
-  - Each deploy creates an immutable release directory and switches 'current' only after success.
-  - Simulation writes <repo>/host/<target><REMOTE_BASE>/releases/version_present.prom for inventory/current tracking.
+  - Templates are sourced from: <root>/inventory/templates/<service>/
+  - Binaries are sourced from:   <root>/bin/<name>
+  - If --remote is NOT provided, ALL targets are treated as local simulations under <root>/hosts/<target>/...
+  - Simulation writes <root>/hosts/<target><REMOTE_BASE>/releases/version_present.prom for inventory/current tracking.
+  - Each release includes: bin/control.sh (service lifecycle) and meta/CONTROL.md (usage guide).
 EOF
 }
 
@@ -87,7 +94,6 @@ validate_args() {
   [[ -n "$APP" ]]         || die "--app is required"
   [[ -n "$ENV_NAME" ]]    || die "--env is required"
   [[ -n "$TARGETS_RAW" ]] || die "--targets is required"
-  [[ -n "$SERVICES_RAW" ]]|| die "--services is required"
 
   is_valid_name "$APP"      || die "Invalid app name: $APP"
   is_valid_name "$ENV_NAME" || die "Invalid env name: $ENV_NAME"
@@ -98,6 +104,65 @@ validate_args() {
   require_cmd rm
   require_cmd mv
   require_cmd readlink
+
+  detect_inventory_dir
+}
+
+detect_inventory_dir() {
+  # Inventory is expected at <orchestrator>/inventory.
+  local inv="$ROOT/inventory"
+  if [[ -d "$inv" ]]; then
+    INVENTORY_DIR="$inv"
+    return 0
+  fi
+
+  die "Inventory directory not found: $inv"
+}
+
+detect_yq() {
+  # Prefer a vendored yq binary if present under <root>/tools.
+  local candidate=""
+
+  # Fallback: accept other naming conventions (e.g. yq_darwin_amd64) under tools/.
+  if [[ -d "$ROOT/tools" ]]; then
+    candidate="$(find "$ROOT/tools" -maxdepth 1 -type f -name 'yq*' 2>/dev/null | head -n 1 || true)"
+    if [[ -n "$candidate" ]]; then
+      if [[ ! -x "$candidate" ]]; then
+        chmod +x "$candidate" 2>/dev/null || true
+      fi
+      if [[ -x "$candidate" ]]; then
+        YQ_BIN="$candidate"
+        return 0
+      fi
+    fi
+  fi
+
+  # Last resort: system yq.
+  if command -v yq >/dev/null 2>&1; then
+    YQ_BIN="yq"
+    return 0
+  fi
+
+  die "yq is required to read inventory YAML. Install yq or vendor it at <root>/tools/yq (ensure it is executable)"
+}
+
+load_default_services_for_app() {
+  # Reads apps.<APP>.defaults.services from inventory/apps.yml.
+  # Tries the provided APP key first, then common case variants.
+  local app="$APP"
+  local apps_file="$INVENTORY_DIR/apps.yml"
+  [[ -f "$apps_file" ]] || die "apps.yml not found: $apps_file"
+
+  local q value
+  for q in "$app" "$(echo "$app" | tr '[:lower:]' '[:upper:]')" "$(echo "$app" | tr '[:upper:]' '[:lower:]')"; do
+    value="$("$YQ_BIN" -r ".apps.\"$q\".defaults.services | join(\",\")" "$apps_file" 2>/dev/null || true)"
+    if [[ -n "$value" && "$value" != "null" ]]; then
+      SERVICES_RAW="$value"
+      return 0
+    fi
+  done
+
+  die "No default services found for app '$APP' in $apps_file (expected: apps.<APP>.defaults.services)"
 }
 
 # ---- Build release (stdout = data only) --------------------------------------
@@ -118,17 +183,18 @@ build_release() {
 
   log "Building release: $release_id"
 
-  # Copy templates: template/<service>/... -> config/<service>/...
-  local svc
+  # Copy templates: orchestrator/inventory/templates/<service>/... -> config/<service>/
+  local svc template_src
   for svc in $(normalize_list "$SERVICES_RAW"); do
-    if [[ -d "$ROOT/template/$svc" ]]; then
+    template_src="$INVENTORY_DIR/templates/$svc"
+    if [[ -d "$template_src" ]]; then
       mkdir -p "$pkg_dir/config/$svc"
-      cp -r "$ROOT/template/$svc/." "$pkg_dir/config/$svc/"
+      cp -r "$template_src/." "$pkg_dir/config/$svc/"
     else
       if [[ "$STRICT_MODE" == "true" ]]; then
-        die "Strict mode: missing template for service '$svc' (expected: template/$svc)"
+        die "Strict mode: missing template for service '$svc' (expected: orchestrator/inventory/templates/$svc)"
       fi
-      warn "Missing template for service '$svc' (expected: template/$svc). Continuing (non-strict mode)."
+      warn "Missing template for service '$svc' (expected: orchestrator/inventory/templates/$svc). Continuing (non-strict mode)."
     fi
   done
 
@@ -139,11 +205,33 @@ build_release() {
       chmod +x "$pkg_dir/bin/$svc" || true
     else
       if [[ "$STRICT_MODE" == "true" ]]; then
-        die "Strict mode: missing binary for service '$svc' (expected: bin/$svc)"
+        die "Strict mode: missing binary for service '$svc' (expected: <repo>/bin/$svc)"
       fi
-      warn "Missing binary for service '$svc' (expected: bin/$svc). Continuing (non-strict mode)."
+      warn "Missing binary for service '$svc' (expected: <repo>/bin/$svc). Continuing (non-strict mode)."
     fi
   done
+
+  # Include runtime control plane utilities (shipped with every release)
+  # Source (repo): <root>/scripts/runtime/control.sh and <root>/scripts/runtime/CONTROL.md
+  # Target (release): bin/control.sh and meta/CONTROL.md
+  if [[ -f "$ROOT/scripts/runtime/control.sh" ]]; then
+    cp "$ROOT/scripts/runtime/control.sh" "$pkg_dir/bin/control.sh"
+    chmod +x "$pkg_dir/bin/control.sh" || true
+  else
+    if [[ "$STRICT_MODE" == "true" ]]; then
+      die "Strict mode: missing runtime control script (expected: $ROOT/scripts/runtime/control.sh)"
+    fi
+    warn "Missing runtime control script (expected: $ROOT/scripts/runtime/control.sh). Continuing (non-strict mode)."
+  fi
+
+  if [[ -f "$ROOT/scripts/runtime/CONTROL.md" ]]; then
+    cp "$ROOT/scripts/runtime/CONTROL.md" "$pkg_dir/meta/CONTROL.md"
+  else
+    if [[ "$STRICT_MODE" == "true" ]]; then
+      die "Strict mode: missing control documentation (expected: $ROOT/scripts/runtime/CONTROL.md)"
+    fi
+    warn "Missing control documentation (expected: $ROOT/scripts/runtime/CONTROL.md). Continuing (non-strict mode)."
+  fi
 
   # Metadata
   cat > "$pkg_dir/meta/manifest.txt" <<EOF
@@ -174,10 +262,10 @@ deploy_simulated_host() {
   local release_id="$2"
   local tarball="$3"
 
-  local simulated_host_root="$ROOT/host/$target_name"
+  local simulated_host_root="$ROOT/hosts/$target_name"
   local remote_base="${SPPMON_REMOTE_BASE:-$DEFAULT_REMOTE_BASE}"
 
-  # Final base path (simulation): <repo>/host/<target><REMOTE_BASE>
+  # Final base path (simulation): <root>/host/<target><REMOTE_BASE>
   local base="$simulated_host_root$remote_base"
   [[ "$base" == "$simulated_host_root"* ]] || die "Refusing to deploy outside simulated host root: base=$base"
 
@@ -253,8 +341,12 @@ main() {
   parse_args "$@"
   validate_args
 
-  if [[ "$STRICT_MODE" != "true" ]]; then
-    log "Non-strict mode: missing templates/binaries are warnings; tarball is still created. Use --strict to fail fast."
+  detect_yq
+
+  if [[ -z "${SERVICES_RAW:-}" ]]; then
+    log "No --services provided; using defaults from inventory/apps.yml for app '$APP'."
+    load_default_services_for_app
+    log "Resolved default services: $SERVICES_RAW"
   fi
 
   local result release_id tarball work_dir

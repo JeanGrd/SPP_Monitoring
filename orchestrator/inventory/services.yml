@@ -1,0 +1,10 @@
+binaries:
+  alloy:
+    description: "Grafana Alloy Agent"
+    args: "run..."
+    binaries: ["alloy"]
+
+  loki:
+    description: "Grafana Alloy Agent"
+    args: "run..."
+    binaries: [ "alloy" ]

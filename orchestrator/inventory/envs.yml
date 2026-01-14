@@ -1,0 +1,18 @@
+envs:
+  UAT:
+    endpoint:
+      mimir: ""
+      minio: ""
+      loki: ""
+    infra-hosts:
+      - "infra-uat-1"
+      - "infra-uat-2"
+
+  PRD:
+    endpoint:
+      mimir: ""
+      minio: ""
+      loki: ""
+    infra-hosts:
+      - "infra-uat-1"
+      - "infra-uat-2"

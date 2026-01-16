@@ -1,7 +1,0 @@
-tenants:
-  ICOM:
-    UAT: "icompre"
-    PRD: "icomprd"
-  Jaguar:
-    UAT: "jagpre"
-    PRD: "jagprd"

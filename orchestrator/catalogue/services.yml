@@ -1,0 +1,12 @@
+services:
+  alloy_agent:
+    description: "Grafana Alloy Agent (runtime)"
+    binaries: ["alloy"]
+    configs: ["alloy_agent"]
+    args: "run..."
+
+  loki_exporter:
+    description: "Extra log pipeline (config only)"
+    binaries: []
+    configs: ["loki_exporter"]
+    requires: ["alloy_agent"]

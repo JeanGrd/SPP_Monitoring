@@ -1,9 +1,0 @@
-apps:
-  ICOM:
-    defaults:
-      binaries: ["alloy"]
-      config: ["alloy_agent", "loki_exporter"]
-
-  Jaguar:
-    defaults:
-      services: ["alloy_agent", "loki_exporter"]

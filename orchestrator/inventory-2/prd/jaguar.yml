@@ -1,9 +1,0 @@
-app: JAGUAR
-env: PRD
-tenant_id: jagprd
-
-services: ["alloy_agent", "loki_exporter"]
-
-vars:
-  instance_name: "HEY HEY HEY"
-  mimir: ref:common_vars.mimir_prd_host

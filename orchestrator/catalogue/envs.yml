@@ -4,6 +4,7 @@ envs:
       mimir: ""
       minio: ""
       loki: ""
+
     infra-hosts:
       - "infra-uat-1"
       - "infra-uat-2"
@@ -13,6 +14,7 @@ envs:
       mimir: ""
       minio: ""
       loki: ""
+
     infra-hosts:
       - "infra-uat-1"
       - "infra-uat-2"

@@ -1,0 +1,14 @@
+app: ICOM
+env: PRD
+tenant: icomprd
+
+services:
+  alloy_agent:
+    binaries: ["alloy"]
+    configs: ["alloy_agent", "loki_exporter"]
+    args: "run ..."
+
+vars:
+  instance_name: "HEY HEY HEY"
+  mimir: default.mimir_prd_host
+

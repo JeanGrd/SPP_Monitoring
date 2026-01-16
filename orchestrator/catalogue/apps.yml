@@ -1,0 +1,14 @@
+apps:
+  ICOM:
+    tenants:
+      UAT: "icompre"
+      PRD: "icomprd"
+    defaults:
+      services: ["alloy_agent", "loki_exporter"]
+
+  Jaguar:
+    tenants:
+      UAT: "jagpre"
+      PRD: "jagprd"
+    defaults:
+      services: ["alloy_agent"]

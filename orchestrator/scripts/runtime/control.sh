@@ -4,11 +4,9 @@ set -euo pipefail
 # ------------------------------------------------------------------------------
 # control.sh - Service lifecycle manager for a deployed SPPMon release
 #
-# This script is shipped in every release under:
-#   <sppmon>/current/bin/control.sh
+# This script manages the CURRENT release under <sppmon>/current (symlink to a release).
 #
-# It controls the services of the CURRENT release via:
-#   <sppmon>/current/meta/manifest.txt
+# Services and runtime args are provided by: <release>/bin/environment.sh
 #
 # Runtime convention (under <sppmon>/volumes):
 #   volumes/
@@ -26,9 +24,9 @@ log() { echo "[$(ts)] $*" >&2; }
 die() { log "ERROR: $*"; exit 1; }
 
 # ---- Path resolution ----------------------------------------------------------
-#
+
 # control.sh lives at: <base>/current/bin/control.sh (via symlink), or directly at:
-# <base>/releases/<release_id>/bin/control.sh
+# <base>/releases/<release_bnid>/bin/control.sh
 #
 # We resolve:
 #   RELEASE_DIR = .../releases/<release_id>
@@ -37,14 +35,16 @@ die() { log "ERROR: $*"; exit 1; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RELEASE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"      # .../<release_id>
-MANIFEST="$RELEASE_DIR/meta/manifest.txt"
 
 # BASE_DIR = parent of releases/ directory
 # Release dir is: <base>/releases/<release_id>
 BASE_DIR="$(cd "$RELEASE_DIR/../.." && pwd)"
 
 RELEASE_BIN="$RELEASE_DIR/bin"
-RELEASE_CFG="$RELEASE_DIR/config"
+RELEASE_ETC="$RELEASE_DIR/etc"
+RELEASE_LIB="$RELEASE_DIR/lib"
+ENV_FILE="$RELEASE_BIN/environment.sh"
+
 VOLUMES="$BASE_DIR/volumes"
 RUN_DIR="$VOLUMES/run"
 LOG_DIR="$VOLUMES/logs"
@@ -69,35 +69,18 @@ COMMANDS:
   stop   <service>              Stop a service
   restart <service>             Restart a service
   logs   <service> [--tail N]   Tail service logs (default: $DEFAULT_TAIL_LINES)
-  list                          List services from the release manifest
+  list                          List services from the environment
   clean  logs|run               Clean logs or runtime pid files (SAFE)
   clean  data --force           DANGEROUS: remove persistent data for this deployment
 
 NOTES:
-  - This script operates on the CURRENT release (via the 'current' symlink).
+  - Services are resolved from: $ENV_FILE
+  - Binaries are under: $RELEASE_LIB
+  - Composed Alloy entrypoint: $RELEASE_ETC/config.alloy
   - PIDs are stored under: $RUN_DIR
   - Logs are stored under: $LOG_DIR
 
 EOF
-}
-
-require_manifest() {
-  [[ -f "$MANIFEST" ]] || die "Manifest not found: $MANIFEST (release may be corrupted)"
-}
-
-read_manifest_value() {
-  local key="$1"
-  require_manifest
-  # manifest.txt is key=value lines
-  grep -E "^${key}=" "$MANIFEST" | head -n 1 | cut -d'=' -f2- || true
-}
-
-list_services() {
-  local services
-  services="$(read_manifest_value "services")"
-  [[ -n "$services" ]] || die "No 'services' found in manifest: $MANIFEST"
-  # normalize comma-separated into newline
-  echo "$services" | tr ',' '\n' | sed '/^\s*$/d'
 }
 
 pid_file() { echo "$RUN_DIR/$1.pid"; }
@@ -116,41 +99,32 @@ ensure_runtime_dirs() {
   mkdir -p "$RUN_DIR" "$LOG_DIR" "$DATA_DIR"
 }
 
-# ---- Service command resolution ----------------------------------------------
-#
-# Keep the logic here minimal: map service -> binary + args.
-# In the future, you can generate these args from inventory/services.yml and
-# ship a resolved runtime config inside the release meta/ if needed.
-#
+require_environment() {
+  [[ -f "$ENV_FILE" ]] || die "environment.sh not found: $ENV_FILE (release may be corrupted)"
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+}
 
-service_binary() {
-  local svc="$1"
-  local bin="$RELEASE_BIN/$svc"
-  [[ -x "$bin" ]] || die "Binary not found or not executable for '$svc': $bin"
-  echo "$bin"
+list_services() {
+  require_environment
+  sppmon_list_services
 }
 
 service_args() {
   local svc="$1"
+  require_environment
+  local val
+  val="$(sppmon_service_args "$svc")"
+  [[ -n "$val" ]] || die "No args found for service '$svc' (service may be config-only)"
+  echo "$val"
+}
 
-  case "$svc" in
-    alloy_agent)
-      # Convention: templates are deployed into config/<service>/
-      # Expect the service main config at config/alloy_agent/config.alloy
-      local cfg="$RELEASE_CFG/alloy_agent/config.alloy"
-      [[ -f "$cfg" ]] || die "Missing Alloy config: $cfg"
-      echo "run \"$cfg\" --storage.path=\"$DATA_DIR/alloy\" --server.http.listen-addr=0.0.0.0:8121"
-      ;;
-    loki_exporter)
-      # In many setups, loki_exporter is not a separate binary; it's a config extension.
-      # If you later ship a separate binary, you can implement it here.
-      # For now, fail explicitly (or treat as a no-op).
-      die "Service 'loki_exporter' is configured as a template-only feature (no standalone runtime command)."
-      ;;
-    *)
-      die "Unknown service '$svc' (no runtime command mapping)."
-      ;;
-  esac
+# Resolve the runtime binary for a service.
+# For now, all launchable services run via the Alloy binary.
+service_binary() {
+  local alloy="$RELEASE_LIB/alloy"
+  [[ -x "$alloy" ]] || die "Alloy binary not found or not executable: $alloy"
+  echo "$alloy"
 }
 
 # ---- Actions -----------------------------------------------------------------

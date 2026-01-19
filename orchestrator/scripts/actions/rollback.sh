@@ -177,14 +177,26 @@ select_previous_release() {
   local releases_dir="$1"
   local current_release="$2"
 
-  # Newest first
-  local rel
-  while IFS= read -r rel; do
-    [[ "$rel" == "$current_release" ]] && continue
-    echo "$rel"
+  if [[ -z "$current_release" ]]; then
+    echo ""
     return 0
+  fi
+
+  # Newest first list
+  local rel
+  local found="false"
+  while IFS= read -r rel; do
+    if [[ "$found" == "true" ]]; then
+      # The first item *after* current in newest-first order is the previous (older) release.
+      echo "$rel"
+      return 0
+    fi
+    if [[ "$rel" == "$current_release" ]]; then
+      found="true"
+    fi
   done < <(find "$releases_dir" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -exec basename {} \; | sort -r)
 
+  # If we never found current or there is no older release
   echo ""
 }
 
@@ -198,7 +210,7 @@ select_latest_release() {
 rollback_simulated_host() {
   local target_name="$1"
 
-  local simulated_host_root="$ROOT/host/$target_name"
+  local simulated_host_root="$ROOT/hosts/$target_name"
   local remote_base="${SPPMON_REMOTE_BASE:-$DEFAULT_REMOTE_BASE}"
 
   # Layout: <repo>/host/<target><REMOTE_BASE>/{releases,current}
@@ -223,7 +235,7 @@ rollback_simulated_host() {
   local selected_release="$RELEASE_ID"
   if [[ "$USE_PREVIOUS" == "true" ]]; then
     selected_release="$(select_previous_release "$releases_dir" "$current_release")"
-    [[ -n "$selected_release" ]] || die "--previous requested but no previous release is available (need at least 2 releases)"
+    [[ -n "$selected_release" ]] || die "--previous requested but no older release is available (current is oldest or not found)"
     log "Selected previous release: $selected_release (current was: ${current_release:-none})"
   fi
   if [[ "$USE_LATEST" == "true" ]]; then

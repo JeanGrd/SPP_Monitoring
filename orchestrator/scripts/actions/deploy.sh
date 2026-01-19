@@ -19,7 +19,6 @@ set -euo pipefail
 # ------------------------------------------------------------------------------
 
 # shellcheck disable=SC2164
-# shellcheck disable=SC2164
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIB_DIR="$(cd "$SCRIPT_DIR/../lib" && pwd)"
 # shellcheck source=../lib/utils.sh
@@ -28,7 +27,6 @@ source "$LIB_DIR/utils.sh"
 # ---- Defaults ----------------------------------------------------------------
 
 DEFAULT_REMOTE_BASE="/sppmon"
-DEFAULT_SSH_PORT="22"
 
 # ---- Parsed arguments --------------------------------------------------------
 
@@ -41,7 +39,6 @@ RESOLVED_SERVICES_RAW=""
 ENABLE_REMOTE="false"
 STRICT_MODE="false"
 catalogue_DIR=""
-REPO_ROOT=""
 YQ_BIN=""
 
 print_help() {
@@ -64,11 +61,11 @@ OPTIONAL:
   --help               Show this help
 
 NOTES:
-  - Templates are sourced from: <root>/catalogue/templates/<service>/
-  - Binaries are sourced from:   <root>/bin/<name>
+  - Templates are packaged under: etc/ (flattened copy of <root>/catalogue/templates/<service>/).
+  - Binaries are sourced from:   <root>/bin/<name> and packaged under lib/ in the release.
   - If --remote is NOT provided, ALL targets are treated as local simulations under <root>/hosts/<target>/...
   - Simulation writes <root>/hosts/<target><REMOTE_BASE>/releases/version_present.prom for catalogue/current tracking.
-  - Each release includes: bin/control.sh (service lifecycle) and meta/CONTROL.md (usage guide).
+  - Each release includes: bin/control.sh, bin/readme.txt (usage guide), and bin/environment.sh (machine-readable service runtime info).
 EOF
 }
 
@@ -244,17 +241,18 @@ build_release() {
   work_dir="$(mktemp -d)"
   pkg_dir="$work_dir/$release_id"
 
-  mkdir -p "$dist_dir" "$pkg_dir/bin" "$pkg_dir/config" "$pkg_dir/meta"
+  mkdir -p "$dist_dir" "$pkg_dir/bin" "$pkg_dir/lib" "$pkg_dir/etc" "$pkg_dir/meta"
 
   log "Building release: $release_id"
 
-  # Copy templates: orchestrator/catalogue/templates/<service>/... -> config/<service>/
+  # Copy templates (flattened) ... -> etc/
   local svc template_src
   for svc in $(normalize_list "$RESOLVED_SERVICES_RAW"); do
     template_src="$catalogue_DIR/templates/$svc"
     if [[ -d "$template_src" ]]; then
-      mkdir -p "$pkg_dir/config/$svc"
-      cp -r "$template_src/." "$pkg_dir/config/$svc/"
+      # Flatten: copy the *contents* of each service template directory into etc/
+      # This assumes template filenames are unique across selected services.
+      cp -r "$template_src/." "$pkg_dir/etc/"
     else
       if [[ "$STRICT_MODE" == "true" ]]; then
         die "Strict mode: missing template for service '$svc' (expected: orchestrator/catalogue/templates/$svc)"
@@ -290,8 +288,8 @@ build_release() {
 
     for bin_name in $(normalize_list "$bin_list"); do
       if [[ -f "$ROOT/bin/$bin_name" ]]; then
-        cp "$ROOT/bin/$bin_name" "$pkg_dir/bin/$bin_name"
-        chmod +x "$pkg_dir/bin/$bin_name" || true
+        cp "$ROOT/bin/$bin_name" "$pkg_dir/lib/$bin_name"
+        chmod +x "$pkg_dir/lib/$bin_name" || true
       else
         if [[ "$STRICT_MODE" == "true" ]]; then
           die "Strict mode: missing binary '$bin_name' for service '$svc' (expected: <repo>/bin/$bin_name)"
@@ -301,9 +299,8 @@ build_release() {
     done
   done
 
-  # Include runtime control plane utilities (shipped with every release)
-  # Source (repo): <root>/scripts/runtime/control.sh and <root>/scripts/runtime/CONTROL.md
-  # Target (release): bin/control.sh and meta/CONTROL.md
+  # Include runtime control plane (shipped with every release)
+  # Target (release): bin/control.sh and bin/readme.txt (or CONTROL.txt)
   if [[ -f "$ROOT/scripts/runtime/control.sh" ]]; then
     cp "$ROOT/scripts/runtime/control.sh" "$pkg_dir/bin/control.sh"
     chmod +x "$pkg_dir/bin/control.sh" || true
@@ -314,14 +311,49 @@ build_release() {
     warn "Missing runtime control script (expected: $ROOT/scripts/runtime/control.sh). Continuing (non-strict mode)."
   fi
 
-  if [[ -f "$ROOT/scripts/runtime/CONTROL.md" ]]; then
-    cp "$ROOT/scripts/runtime/CONTROL.md" "$pkg_dir/meta/CONTROL.md"
+  if [[ -f "$ROOT/scripts/runtime/readme.txt" ]]; then
+    cp "$ROOT/scripts/runtime/readme.txt" "$pkg_dir/bin/readme.txt"
+  elif [[ -f "$ROOT/scripts/runtime/CONTROL.txt" ]]; then
+    cp "$ROOT/scripts/runtime/CONTROL.txt" "$pkg_dir/bin/CONTROL.txt"
   else
     if [[ "$STRICT_MODE" == "true" ]]; then
-      die "Strict mode: missing control documentation (expected: $ROOT/scripts/runtime/CONTROL.md)"
+      die "Strict mode: missing control documentation (expected: $ROOT/scripts/runtime/readme.txt or CONTROL.txt)"
     fi
-    warn "Missing control documentation (expected: $ROOT/scripts/runtime/CONTROL.md). Continuing (non-strict mode)."
+    warn "Missing control documentation (expected: $ROOT/scripts/runtime/readme.txt or CONTROL.txt). Continuing (non-strict mode)."
   fi
+
+  # Generate machine-readable service catalogue for control.sh (bash-sourceable)
+  local catalogue_out
+  catalogue_out="$pkg_dir/bin/environment.sh"
+
+  {
+    echo "#!/usr/bin/env bash"
+    echo
+    echo "declare -a SPPMON_SERVICES=()"
+    echo "declare -A SPPMON_SERVICE_ARGS=()"
+    echo
+    for svc in $(normalize_list "$RESOLVED_SERVICES_RAW"); do
+      local args trimmed
+      args="$($YQ_BIN -r ".services.\"$svc\".args // \"\"" "$services_file" 2>/dev/null || true)"
+      [[ "$args" == "null" ]] && args=""
+
+      # Escape backslashes and double-quotes for safe bash string literals
+      args="${args//\\/\\\\}"; args="${args//\"/\\\"}"
+
+      # Robust trim: remove all whitespace
+      trimmed="$(echo "$args" | tr -d '[:space:]')"
+      # If args are empty, the service is config-only and should not be launched.
+      if [[ -z "$trimmed" ]]; then
+        continue
+      fi
+
+      echo "SPPMON_SERVICES+=(\"$svc\")"
+      echo "SPPMON_SERVICE_ARGS[\"$svc\"]=\"$args\""
+      echo
+    done
+  } > "$catalogue_out"
+
+  chmod +x "$catalogue_out" || true
 
   # Metadata
   cat > "$pkg_dir/meta/manifest.txt" <<EOF
@@ -333,6 +365,12 @@ services=$RESOLVED_SERVICES_RAW
 EOF
 
   ( cd "$pkg_dir" && find . -type f | sort ) > "$pkg_dir/meta/files.txt"
+
+  # Update any runtime.env config path from config/ to etc/
+  if [[ -f "$pkg_dir/meta/runtime.env" ]]; then
+    # Only replace config/ with etc/ in ARGS or path values
+    sed -i.bak 's/config\//etc\//g' "$pkg_dir/meta/runtime.env" && rm -f "$pkg_dir/meta/runtime.env.bak"
+  fi
 
   tarball="$dist_dir/${release_id}.tar.gz"
 
@@ -394,7 +432,7 @@ deploy_simulated_host() {
   ln -sfn "$new_release" "$current"
   log "OK (simulation): current -> $(readlink "$current")"
 
-  # Write catalogue Prometheus textfile
+      # Write catalogue Prometheus textfile
   local catalogue_file="$releases/version_present.prom"
   local current_basename
   current_basename="$(basename "$(readlink "$current")")"
@@ -415,7 +453,7 @@ deploy_simulated_host() {
     done
   } > "$catalogue_file"
 
-  log "Wrote release catalogue: $catalogue_file"
+      log "Wrote release catalogue: $catalogue_file"
 }
 
 # ---- Remote placeholder ------------------------------------------------------

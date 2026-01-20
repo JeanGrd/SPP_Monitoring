@@ -38,7 +38,7 @@ RELEASE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"      # .../<release_id>
 
 # BASE_DIR = parent of releases/ directory
 # Release dir is: <base>/releases/<release_id>
-BASE_DIR="$(cd "$RELEASE_DIR/../.." && pwd)"
+BASE_DIR="$(cd "$RELEASE_DIR/.." && pwd)"
 
 RELEASE_BIN="$RELEASE_DIR/bin"
 RELEASE_ETC="$RELEASE_DIR/etc"
@@ -65,18 +65,18 @@ USAGE:
 
 COMMANDS:
   status [service]              Show status of one service or all services
-  start  <service>              Start a service
-  stop   <service>              Stop a service
-  restart <service>             Restart a service
+  start  <service|all>          Start one service or all services
+  stop   <service|all>          Stop one service or all services
+  restart <service|all>         Restart one service or all services
   logs   <service> [--tail N]   Tail service logs (default: $DEFAULT_TAIL_LINES)
   list                          List services from the environment
   clean  logs|run               Clean logs or runtime pid files (SAFE)
   clean  data --force           DANGEROUS: remove persistent data for this deployment
 
 NOTES:
-  - Services are resolved from: $ENV_FILE
+  - Runtime services are resolved from: $ENV_FILE
   - Binaries are under: $RELEASE_LIB
-  - Composed Alloy entrypoint: $RELEASE_ETC/config.alloy
+  - Entrypoint and flags are defined by SPPMON_ARGS__* in environment.sh
   - PIDs are stored under: $RUN_DIR
   - Logs are stored under: $LOG_DIR
 
@@ -99,32 +99,94 @@ ensure_runtime_dirs() {
   mkdir -p "$RUN_DIR" "$LOG_DIR" "$DATA_DIR"
 }
 
+# Clear previously loaded SPPMon runtime variables so environment.sh changes are reflected.
+clear_environment_vars() {
+  local v
+  # compgen exists in Bash 3+ and lists shell variable names.
+  for v in $(compgen -v | grep '^SPPMON_' || true); do
+    unset "$v" 2>/dev/null || true
+  done
+}
+
 require_environment() {
   [[ -f "$ENV_FILE" ]] || die "environment.sh not found: $ENV_FILE (release may be corrupted)"
+
+  # Reload fresh every time to support live edits.
+  clear_environment_vars
+
   # shellcheck disable=SC1090
   source "$ENV_FILE"
+
+  [[ -n "${SPPMON_RUNTIME_SERVICES:-}" ]] || die "Invalid environment.sh: SPPMON_RUNTIME_SERVICES is not set"
+}
+
+safe_key() {
+  echo "$1" | sed -E 's/[^A-Za-z0-9_]/_/g'
 }
 
 list_services() {
   require_environment
-  sppmon_list_services
+  local s
+  for s in $SPPMON_RUNTIME_SERVICES; do
+    [[ -n "$s" ]] && echo "$s"
+  done
+}
+
+reverse_lines() {
+  # Portable reverse for a newline-delimited list.
+  awk '{a[NR]=$0} END{for(i=NR;i>=1;i--) print a[i]}'
 }
 
 service_args() {
   local svc="$1"
   require_environment
-  local val
-  val="$(sppmon_service_args "$svc")"
-  [[ -n "$val" ]] || die "No args found for service '$svc' (service may be config-only)"
+
+  local safe var val
+  safe="$(safe_key "$svc")"
+  var="SPPMON_ARGS__${safe}"
+  val="${!var-}"
+
+  [[ -n "${val//[[:space:]]/}" ]] || die "Service '$svc' has no args defined (not launchable)"
+
+  # If args look like 'run <dir>' and the dir contains config.alloy, fix it to 'run <dir>/config.alloy'.
+  local a1 a2 rest
+  a1="$(echo "$val" | awk '{print $1}')"
+  a2="$(echo "$val" | awk '{print $2}')"
+  rest="$(echo "$val" | cut -d' ' -s -f3-)"
+
+  if [[ "$a1" == "run" && -n "$a2" ]]; then
+    local abs
+    if [[ "$a2" = /* ]]; then
+      abs="$a2"
+    else
+      abs="$RELEASE_DIR/$a2"
+    fi
+    if [[ -d "$abs" && -f "$abs/config.alloy" ]]; then
+      if [[ -n "$rest" ]]; then
+        val="run $a2/config.alloy $rest"
+      else
+        val="run $a2/config.alloy"
+      fi
+    fi
+  fi
+
   echo "$val"
 }
 
-# Resolve the runtime binary for a service.
-# For now, all launchable services run via the Alloy binary.
 service_binary() {
-  local alloy="$RELEASE_LIB/alloy"
-  [[ -x "$alloy" ]] || die "Alloy binary not found or not executable: $alloy"
-  echo "$alloy"
+  local svc="$1"
+  require_environment
+
+  local safe var bin
+  safe="$(safe_key "$svc")"
+  var="SPPMON_BIN__${safe}"
+  bin="${!var-}"
+
+  [[ -n "${bin//[[:space:]]/}" ]] || die "Service '$svc' has no binary defined"
+
+  local path="$RELEASE_LIB/$bin"
+  [[ -x "$path" ]] || die "Binary not found or not executable: $path"
+  echo "$path"
 }
 
 # ---- Actions -----------------------------------------------------------------
@@ -136,7 +198,7 @@ cmd_list() {
 cmd_status_one() {
   local svc="$1"
   if is_running "$svc"; then
-    local pid; pid="$(cat "$(pid_file "$svc")")"
+    local pid; pid="$(cat "$(pid_file "$svc")" 2>/dev/null || true)"
     echo "$svc: running (pid=$pid)"
   else
     echo "$svc: stopped"
@@ -154,9 +216,25 @@ cmd_status() {
 }
 
 cmd_start() {
-  local svc="$1"
-  [[ -n "$svc" ]] || die "start requires a service name"
+  local svc="${1:-}"
+  [[ -n "$svc" ]] || die "start requires a service name (or 'all')"
   ensure_runtime_dirs
+
+  if [[ "$svc" == "all" ]]; then
+    local s
+    while read -r s; do
+      [[ -n "$s" ]] || continue
+      cmd_start "$s"
+    done < <(list_services)
+    return 0
+  fi
+
+  if ! list_services | grep -qx "$svc"; then
+    log "Unknown service: $svc"
+    log "Available services:"
+    list_services | sed 's/^/  - /' >&2
+    die "Unknown service '$svc'"
+  fi
 
   if is_running "$svc"; then
     log "Service already running: $svc"
@@ -174,9 +252,17 @@ cmd_start() {
   log "  args: $args"
   log "  log:  $lf"
 
+  local bin_base
+  bin_base="$(basename "$bin")"
+
+  # Set argv[0] to help identify processes quickly (ps/top).
+  # Example: sppmon:alloy_agent:alloy
+  local proc_name
+  proc_name="sppmon:${svc}:${bin_base}"
+
   # Start in background, capture pid
   # shellcheck disable=SC2086
-  nohup bash -c "exec -a \"$svc\" \"$bin\" $args" >>"$lf" 2>&1 &
+  nohup bash -c "cd \"$RELEASE_DIR\" && exec -a \"$proc_name\" \"$bin\" $args" >>"$lf" 2>&1 &
   local pid=$!
   echo "$pid" > "$pidf"
 
@@ -190,9 +276,26 @@ cmd_start() {
 }
 
 cmd_stop() {
-  local svc="$1"
-  [[ -n "$svc" ]] || die "stop requires a service name"
+  local svc="${1:-}"
+  [[ -n "$svc" ]] || die "stop requires a service name (or 'all')"
   ensure_runtime_dirs
+
+  if [[ "$svc" == "all" ]]; then
+    local s
+    # Stop in reverse order to reduce the chance of stopping a dependency last.
+    while read -r s; do
+      [[ -n "$s" ]] || continue
+      cmd_stop "$s"
+    done < <(list_services | reverse_lines)
+    return 0
+  fi
+
+  if ! list_services | grep -qx "$svc"; then
+    log "Unknown service: $svc"
+    log "Available services:"
+    list_services | sed 's/^/  - /' >&2
+    die "Unknown service '$svc'"
+  fi
 
   if ! is_running "$svc"; then
     log "Service already stopped: $svc"
@@ -224,8 +327,15 @@ cmd_stop() {
 }
 
 cmd_restart() {
-  local svc="$1"
-  [[ -n "$svc" ]] || die "restart requires a service name"
+  local svc="${1:-}"
+  [[ -n "$svc" ]] || die "restart requires a service name (or 'all')"
+
+  if [[ "$svc" == "all" ]]; then
+    cmd_stop all
+    cmd_start all
+    return 0
+  fi
+
   cmd_stop "$svc"
   cmd_start "$svc"
 }

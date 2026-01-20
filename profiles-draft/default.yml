@@ -1,0 +1,26 @@
+description: "General information, infrastructure hosts list and global variables"
+
+environment_info:
+  UAT:
+    - ""
+    - ""
+    - ""
+    - ""
+
+  PRD:
+    - ""
+    - ""
+    - ""
+    - ""
+
+global_vars:
+  mimir_prd_url: "https://mimir-prd.company:28540/api/v1/push"
+  mimir_uat_url: "https://loki-prd.company:28660/loki/api/v1/push"
+
+  release_dir: SPPMON_RELEASE_DIR="."
+  release_etc_dir: export SPPMON_ETC_DIR="etc"
+  release_lib_dir: export SPPMON_LIB_DIR="lib"
+  release_volumes_dir: export SPPMON_VOLUMES_DIR="../volumes"
+  release_data_dir: export SPPMON_DATA_DIR="../volumes/data"
+  release_log_dir: export SPPMON_LOG_DIR="../volumes/logs"
+  release_run_dir: export SPPMON_RUN_DIR="../volumes/run"

@@ -2,8 +2,8 @@ services:
   alloy_agent:
     description: "Grafana Alloy Agent (runtime)"
     binaries: ["alloy"]
-    configs: ["alloy_agent"]
-    args: "run etc"
+    configs: ["alloy_agent", "loki_exporter"]
+    args: "run --storage.path=$SPPMON_DATA_DIR/alloy/ $SPPMON_ETC_DIR"
 
   loki_exporter:
     description: "Extra log pipeline (config only)"

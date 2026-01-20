@@ -27,8 +27,6 @@ source "$LIB_DIR/utils.sh"
 # ---- Defaults ----------------------------------------------------------------
 
 DEFAULT_REMOTE_BASE="/sppmon"
-DEFAULT_SSH_USER=""
-SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 
 # ---- Parsed arguments --------------------------------------------------------
 
@@ -58,7 +56,6 @@ REQUIRED:
 
 OPTIONAL:
   --remote             Enable SSH/SCP remote deployment (disabled by default)
-                       Uses SSH/SCP for deployment; expects key-based authentication.
   --strict             Fail build if any requested service template/binary is missing
   --services <list>    Comma-separated services to include (overrides app defaults)
   --help               Show this help
@@ -105,14 +102,20 @@ validate_args() {
   require_cmd rm
   require_cmd mv
   require_cmd readlink
-  if [[ "$ENABLE_REMOTE" == "true" ]]; then
-    require_cmd ssh
-    require_cmd scp
-  fi
-  catalogue_DIR="$ROOT/catalogue"
-  [[ -d "$catalogue_DIR" ]] || die "catalogue directory not found: $catalogue_DIR"
+
+  detect_catalogue_dir
 }
 
+detect_catalogue_dir() {
+  # catalogue is expected at <orchestrator>/catalogue.
+  local inv="$ROOT/catalogue"
+  if [[ -d "$inv" ]]; then
+    catalogue_DIR="$inv"
+    return 0
+  fi
+
+  die "catalogue directory not found: $inv"
+}
 
 detect_yq() {
   # Prefer a vendored yq binary if present under <root>/tools.
@@ -250,43 +253,24 @@ build_release() {
   for svc in $(normalize_list "$RESOLVED_SERVICES_RAW"); do
     template_src="$catalogue_DIR/templates/$svc"
     if [[ -d "$template_src" ]]; then
-      local entry inner base dest
+      # Copy each entry from the service template dir into etc/
+      local entry base dest
       shopt -s nullglob dotglob
-
-      # Copy the CONTENTS of each template directory into etc/ (no directory wrapper).
       for entry in "$template_src"/*; do
-        if [[ -d "$entry" ]]; then
-          # Flatten one level: copy files/dirs inside this directory into etc/.
-          for inner in "$entry"/*; do
-            base="$(basename "$inner")"
-            dest="$pkg_dir/etc/$base"
+        base="$(basename "$entry")"
+        dest="$pkg_dir/etc/$base"
 
-            if [[ -e "$dest" ]]; then
-              if [[ "$STRICT_MODE" == "true" ]]; then
-                die "Strict mode: template collision for service '$svc': '$base' already exists in etc/"
-              fi
-              warn "Template collision for service '$svc': '$base' already exists in etc/ (overwriting, non-strict mode)."
-              rm -rf "$dest" 2>/dev/null || true
-            fi
-
-            cp -R "$inner" "$pkg_dir/etc/"
-          done
-        else
-          base="$(basename "$entry")"
-          dest="$pkg_dir/etc/$base"
-
-          if [[ -e "$dest" ]]; then
-            if [[ "$STRICT_MODE" == "true" ]]; then
-              die "Strict mode: template collision for service '$svc': '$base' already exists in etc/"
-            fi
-            warn "Template collision for service '$svc': '$base' already exists in etc/ (overwriting, non-strict mode)."
-            rm -rf "$dest" 2>/dev/null || true
+        if [[ -e "$dest" ]]; then
+          if [[ "$STRICT_MODE" == "true" ]]; then
+            die "Strict mode: template collision for service '$svc': '$base' already exists in etc/"
           fi
-
-          cp -R "$entry" "$pkg_dir/etc/"
+          warn "Template collision for service '$svc': '$base' already exists in etc/ (overwriting, non-strict mode)."
+          rm -rf "$dest" 2>/dev/null || true
         fi
-      done
 
+        # Preserve directories and files.
+        cp -R "$entry" "$pkg_dir/etc/"
+      done
       shopt -u nullglob dotglob
     else
       if [[ "$STRICT_MODE" == "true" ]]; then
@@ -449,6 +433,13 @@ built_at=$ts_human
 services=$RESOLVED_SERVICES_RAW
 EOF
 
+  ( cd "$pkg_dir" && find . -type f | sort ) > "$pkg_dir/meta/files.txt"
+
+  # Update any runtime.env config path from config/ to etc/
+  if [[ -f "$pkg_dir/meta/runtime.env" ]]; then
+    # Only replace config/ with etc/ in ARGS or path values
+    sed -i.bak 's/config\//etc\//g' "$pkg_dir/meta/runtime.env" && rm -f "$pkg_dir/meta/runtime.env.bak"
+  fi
 
   tarball="$dist_dir/${release_id}.tar.gz"
 
@@ -531,107 +522,11 @@ deploy_simulated_host() {
       log "Wrote release catalogue: $catalogue_file"
 }
 
-# ---- Remote deployment -------------------------------------------------------
+# ---- Remote placeholder ------------------------------------------------------
 
-deploy_remote_host() {
-  local target_name="$1"
-  local release_id="$2"
-  local tarball="$3"
-
-  local remote_base="${SPPMON_REMOTE_BASE:-$DEFAULT_REMOTE_BASE}"
-  local ssh_user="${SPPMON_SSH_USER:-$DEFAULT_SSH_USER}"
-
-  local remote_host="$target_name"
-  local remote_dest="$target_name"
-  if [[ -n "$ssh_user" ]]; then
-    remote_dest="$ssh_user@$target_name"
-  fi
-
-  # Remote layout under <remote_base>
-  local base="$remote_base"
-  local releases="$base/releases"
-  local volumes="$base/volumes"
-  local current="$base/current"
-
-  local remote_tmp="/tmp/${release_id}.tar.gz"
-  local staging_dir="$releases/.staging_${release_id}"
-  local new_release="$releases/$release_id"
-
-  log "Deploying (remote) into: ${remote_host}${base}"
-
-  # 1) Ensure base directories exist
-  ssh $SSH_OPTS "$remote_dest" "mkdir -p '$releases' '$volumes/data' '$volumes/logs' '$volumes/run'" \
-    || die "SSH mkdir failed on $remote_host"
-
-  # 2) Upload tarball to remote tmp
-  scp $SSH_OPTS "$tarball" "$remote_dest:$remote_tmp" \
-    || die "SCP upload failed to $remote_host:$remote_tmp"
-
-  # 3) Remote extract into staging, move into releases, update symlink, write prom, cleanup
-  ssh $SSH_OPTS "$remote_dest" bash -s -- \
-    "$release_id" "$remote_tmp" "$releases" "$current" <<'REMOTE_SH'
-set -euo pipefail
-
-release_id="$1"
-remote_tmp="$2"
-releases="$3"
-current="$4"
-
-staging="$releases/.staging_${release_id}"
-new_release="$releases/$release_id"
-
-rm -rf "$staging"
-mkdir -p "$staging"
-
-cleanup() {
-  rm -rf "$staging" 2>/dev/null || true
-}
-trap cleanup ERR
-
-# Extract
- tar -xzf "$remote_tmp" -C "$staging"
-
-# Validate
-if [[ ! -d "$staging/$release_id" ]]; then
-  echo "ERROR: Extract failed; '$staging/$release_id' not found" >&2
-  exit 1
-fi
-
-# Move into place (atomic enough for our use)
-rm -rf "$new_release"
-mv "$staging/$release_id" "$new_release"
-
-rm -rf "$staging"
-trap - ERR
-
-# Switch current symlink only after successful install
-ln -sfn "$new_release" "$current"
-
-# Write Prometheus textfile catalogue
-catalogue_file="$releases/version_present.prom"
-current_basename="$(basename "$(readlink "$current")")"
-
-{
-  echo "# HELP sppmon_release Release catalogue (1 = present on disk). Label current=\"true\" marks the active release."
-  echo "# TYPE sppmon_release gauge"
-
-  for d in "$releases"/*; do
-    [[ -d "$d" ]] || continue
-    [[ "$(basename "$d")" == .* ]] && continue
-
-    if [[ "$(basename "$d")" == "$current_basename" ]]; then
-      echo "sppmon_release{release=\"$(basename "$d")\",current=\"true\"} 1"
-    else
-      echo "sppmon_release{release=\"$(basename "$d")\",current=\"false\"} 1"
-    fi
-  done
-} > "$catalogue_file"
-
-# Cleanup uploaded tarball
-rm -f "$remote_tmp" 2>/dev/null || true
-REMOTE_SH
-
-  log "OK (remote): current -> ${remote_base}/releases/${release_id}"
+deploy_remote_placeholder() {
+  warn "Remote deployment requested but SSH/SCP is currently disabled."
+  warn "Enable the SSH block when ready."
 }
 
 # ---- Main --------------------------------------------------------------------
@@ -662,7 +557,7 @@ main() {
   for host in $(normalize_list "$TARGETS_RAW"); do
     log "Deploy target: $host"
     if [[ "$ENABLE_REMOTE" == "true" ]]; then
-      deploy_remote_host "$host" "$release_id" "$tarball"
+      deploy_remote_placeholder
     else
       deploy_simulated_host "$host" "$release_id" "$tarball"
     fi

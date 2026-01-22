@@ -16,8 +16,10 @@ source "$LIB_DIR/utils.sh"
 
 # ---- Defaults ----------------------------------------------------------------
 
-DEFAULT_REMOTE_BASE="/SPP_Monitoring"
-DEFAULT_SSH_USER=""
+# Default deploy base directory (under each host). Can be overridden with SPPMON_REMOTE_BASE.
+# - Simulation: <root>/hosts/<target>/<REMOTE_BASE>/...
+# - Remote:     <remote_login_dir>/<REMOTE_BASE>/...
+DEFAULT_REMOTE_BASE="SPP_Monitoring"
 SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 
 # ---- Parsed arguments --------------------------------------------------------
@@ -32,6 +34,7 @@ ENABLE_REMOTE="false"
 STRICT_MODE="false"
 CATALOGUE_DIR=""
 YQ_BIN=""
+TENANT=""
 
 print_help() {
   cat <<'EOF'
@@ -132,23 +135,75 @@ detect_yq() {
   die "yq is required to read catalogue YAML. Install yq or vendor it at <root>/tools/yq (ensure it is executable)"
 }
 
-load_default_services_for_app() {
-  # Reads apps.<APP>.defaults.services from catalogue/apps.yml.
-  # Tries the provided APP key first, then common case variants.
+resolve_app_key_in_apps_yml() {
+  # Returns the canonical app key as found in catalogue/apps.yml (tries case variants).
   local app="$APP"
   local apps_file="$CATALOGUE_DIR/apps.yml"
   [[ -f "$apps_file" ]] || die "apps.yml not found: $apps_file"
 
-  local q value
+  local q t
   for q in "$app" "$(echo "$app" | tr '[:lower:]' '[:upper:]')" "$(echo "$app" | tr '[:upper:]' '[:lower:]')"; do
-    value="$("$YQ_BIN" -r ".apps.\"$q\".defaults.services | join(\",\")" "$apps_file" 2>/dev/null || true)"
-    if [[ -n "$value" && "$value" != "null" ]]; then
-      SERVICES_RAW="$value"
+    t="$($YQ_BIN -r ".apps.\"$q\" | type" "$apps_file" 2>/dev/null || true)"
+    if [[ -n "$t" && "$t" != "null" ]]; then
+      echo "$q"
       return 0
     fi
   done
 
+  die "App '$APP' not found in $apps_file (expected: apps.<APP>)"
+}
+
+yq_read_apps_scalar() {
+  # Reads a scalar value under .apps.<APP_KEY>.<path>. Returns empty string on null/missing.
+  local app_key="$1"
+  local path="$2"
+  local apps_file="$CATALOGUE_DIR/apps.yml"
+
+  local value
+  value="$($YQ_BIN -r ".apps.\"$app_key\".$path // \"\"" "$apps_file" 2>/dev/null || true)"
+  [[ "$value" == "null" ]] && value=""
+  echo "$value"
+}
+
+load_default_services_for_app() {
+  # Reads apps.<APP>.defaults.services from catalogue/apps.yml.
+  local apps_file="$CATALOGUE_DIR/apps.yml"
+  [[ -f "$apps_file" ]] || die "apps.yml not found: $apps_file"
+
+  local app_key
+  app_key="$(resolve_app_key_in_apps_yml)"
+
+  local value
+  value="$($YQ_BIN -r ".apps.\"$app_key\".defaults.services // [] | join(\",\")" "$apps_file" 2>/dev/null || true)"
+  [[ "$value" == "null" ]] && value=""
+
+  if [[ -n "${value//[[:space:]]/}" ]]; then
+    SERVICES_RAW="$value"
+    return 0
+  fi
+
   die "No default services found for app '$APP' in $apps_file (expected: apps.<APP>.defaults.services)"
+}
+
+load_tenant_for_app() {
+  # Reads apps.<APP>.tenants.<ENV_NAME> from catalogue/apps.yml.
+  local apps_file="$CATALOGUE_DIR/apps.yml"
+  [[ -f "$apps_file" ]] || die "apps.yml not found: $apps_file"
+
+  local app_key
+  app_key="$(resolve_app_key_in_apps_yml)"
+
+  local value
+  value="$(yq_read_apps_scalar "$app_key" "tenants.\"$ENV_NAME\"")"
+
+  if [[ -n "${value//[[:space:]]/}" ]]; then
+    TENANT="$value"
+    return 0
+  fi
+
+  log "$TENANT"
+
+  die "No tenant found for app '$APP' env '$ENV_NAME' in $apps_file (expected: apps.<APP>.tenants.<ENV>)"
 }
 
 load_service_requires() {
@@ -558,62 +613,43 @@ EOF
   printf '%s|%s|%s\n' "$release_id" "$tarball" "$work_dir"
 }
 
-# ---- Local simulation deploy -------------------------------------------------
+# ---- Helpers for deploy layout and catalogue ---------------------------------
 
-deploy_simulated_host() {
-  local target_name="$1"
-  local release_id="$2"
-  local tarball="$3"
+normalize_remote_base_rel() {
+  # Remote base directory relative to the remote login directory.
+  # Accepts either "SPP_Monitoring" or "/SPP_Monitoring"; returns the relative form.
+  local b="${SPPMON_REMOTE_BASE:-$DEFAULT_REMOTE_BASE}"
+  b="${b%/}"
+  b="${b#/}"
+  [[ -n "${b//[[:space:]]/}" ]] || die "Remote base directory is empty (SPPMON_REMOTE_BASE/DEFAULT_REMOTE_BASE)"
+  echo "$b"
+}
 
-  local simulated_host_root="$ROOT/hosts/$target_name"
-  local remote_base="${SPPMON_REMOTE_BASE:-$DEFAULT_REMOTE_BASE}"
+normalize_remote_base_sim() {
+  # Simulation base directory to append under <root>/hosts/<target>.
+  # Accepts either "SPP_Monitoring" or "/SPP_Monitoring"; returns a path starting with '/'.
+  local b="${SPPMON_REMOTE_BASE:-$DEFAULT_REMOTE_BASE}"
+  b="${b%/}"
+  b="/${b#/}"
+  [[ -n "${b//[[:space:]]/}" && "$b" != "/" ]] || die "Simulation base directory is empty (SPPMON_REMOTE_BASE/DEFAULT_REMOTE_BASE)"
+  echo "$b"
+}
 
-  # Final base path (simulation): <root>/host/<target><REMOTE_BASE>
-  local base="$simulated_host_root$remote_base"
-  [[ "$base" == "$simulated_host_root"* ]] || die "Refusing to deploy outside simulated host root: base=$base"
+write_release_catalogue_local() {
+  # Writes releases/version_present.prom for the given releases dir and current symlink.
+  local releases_dir="$1"
+  local current_link="$2"
 
-  local releases="$base/releases"
-  local volumes="$base/volumes"
-  local current="$base/current"
-
-  local staging="$releases/.staging_${release_id}"
-  local new_release="$releases/$release_id"
-
-  # Ensure staging is clean
-  rm -rf "$staging"
-  mkdir -p "$staging"
-
-  cleanup_staging() { rm -rf "$staging" || true; }
-  trap cleanup_staging ERR
-
-  # Extract into staging
-  tar -xzf "$tarball" -C "$staging"
-
-  # Tarball must contain a top-level folder named <release_id>
-  [[ -d "$staging/$release_id" ]] || die "Local extract failed: $staging/$release_id not found"
-
-  # Atomic move into place
-  rm -rf "$new_release"
-  mv "$staging/$release_id" "$new_release"
-
-  # Success: remove staging and release trap
-  rm -rf "$staging"
-  trap - ERR
-
-  # Switch current symlink only after successful install
-  ln -sfn "$new_release" "$current"
-  log "OK (simulation): current -> $(readlink "$current")"
-
-      # Write catalogue Prometheus textfile
-  local catalogue_file="$releases/version_present.prom"
-  local current_basename
-  current_basename="$(basename "$(readlink "$current")")"
+  local catalogue_file current_basename
+  catalogue_file="$releases_dir/version_present.prom"
+  current_basename="$(basename "$(readlink "$current_link")")"
 
   {
     echo "# HELP sppmon_release Release catalogue (1 = present on disk). Label current=\"true\" marks the active release."
     echo "# TYPE sppmon_release gauge"
 
-    for d in "$releases"/*; do
+    local d
+    for d in "$releases_dir"/*; do
       [[ -d "$d" ]] || continue
       [[ "$(basename "$d")" == .* ]] && continue
 
@@ -625,7 +661,55 @@ deploy_simulated_host() {
     done
   } > "$catalogue_file"
 
-      log "Wrote release catalogue: $catalogue_file"
+  log "Wrote release catalogue: $catalogue_file"
+}
+
+# ---- Local simulation deploy -------------------------------------------------
+
+deploy_simulated_host() {
+  local target_name="$1"
+  local release_id="$2"
+  local tarball="$3"
+
+  # ---- Initialize layout paths (simulation) ----------------------------------
+  local simulated_host_root remote_base base
+  local releases volumes current
+  local staging new_release
+
+  simulated_host_root="$ROOT/hosts/$target_name"
+  remote_base="$(normalize_remote_base_sim)"
+
+  # Final base path (simulation): <root>/hosts/<target>/<REMOTE_BASE>
+  base="$simulated_host_root$remote_base"
+  [[ "$base" == "$simulated_host_root"* ]] || die "Refusing to deploy outside simulated host root: base=$base"
+
+  releases="$base/releases"
+  volumes="$base/volumes"
+  current="$base/current"
+
+  staging="$releases/.staging_${release_id}"
+  new_release="$releases/$release_id"
+
+  # ---- Actions ---------------------------------------------------------------
+  rm -rf "$staging"
+  mkdir -p "$staging" "$volumes/data" "$volumes/logs" "$volumes/run"
+
+  cleanup_staging() { rm -rf "$staging" || true; }
+  trap cleanup_staging ERR
+
+  tar -xzf "$tarball" -C "$staging"
+  [[ -d "$staging/$release_id" ]] || die "Local extract failed: $staging/$release_id not found"
+
+  rm -rf "$new_release"
+  mv "$staging/$release_id" "$new_release"
+
+  rm -rf "$staging"
+  trap - ERR
+
+  ln -sfn "$new_release" "$current"
+  log "OK (simulation): current -> $(readlink "$current")"
+
+  write_release_catalogue_local "$releases" "$current"
 }
 
 # ---- Remote deployment -------------------------------------------------------
@@ -635,36 +719,33 @@ deploy_remote_host() {
   local release_id="$2"
   local tarball="$3"
 
-  local remote_base="${SPPMON_REMOTE_BASE:-$DEFAULT_REMOTE_BASE}"
-  local ssh_user="${SPPMON_SSH_USER:-$DEFAULT_SSH_USER}"
+  # ---- Initialize connection + layout (remote) ------------------------------
+  local ssh_user remote_dest remote_host
+  local base releases volumes current
+  local remote_tmp
 
-  local remote_host="$target_name"
-  local remote_dest="$target_name"
-  if [[ -n "$ssh_user" ]]; then
-    remote_dest="$ssh_user@$target_name"
-  fi
+  ssh_user="$TENANT"
+  [[ -n "${ssh_user//[[:space:]]/}" ]] || die "Remote deploy requires TENANT (SSH user) resolved from catalogue/apps.yml"
 
-  # Remote layout under <remote_base>
-  local base="$remote_base"
-  local releases="$base/releases"
-  local volumes="$base/volumes"
-  local current="$base/current"
+  remote_host="$target_name"
+  remote_dest="$ssh_user@$target_name"
 
-  local remote_tmp="/tmp/${release_id}.tar.gz"
-  local staging_dir="$releases/.staging_${release_id}"
-  local new_release="$releases/$release_id"
+  base="$(normalize_remote_base_rel)"
+  releases="$base/releases"
+  volumes="$base/volumes"
+  current="$base/current"
 
-  log "Deploying (remote) into: ${remote_host}${base}"
+  remote_tmp="/tmp/${release_id}.tar.gz"
 
-  # 1) Ensure base directories exist
+  log "Deploying (remote) into: ${remote_host}:${base} (relative to login dir)"
+
+  # ---- Actions ---------------------------------------------------------------
   ssh $SSH_OPTS "$remote_dest" "mkdir -p '$releases' '$volumes/data' '$volumes/logs' '$volumes/run'" \
     || die "SSH mkdir failed on $remote_host"
 
-  # 2) Upload tarball to remote tmp
   scp $SSH_OPTS "$tarball" "$remote_dest:$remote_tmp" \
     || die "SCP upload failed to $remote_host:$remote_tmp"
 
-  # 3) Remote extract into staging, move into releases, update symlink, write prom, cleanup
   ssh $SSH_OPTS "$remote_dest" bash -s -- \
     "$release_id" "$remote_tmp" "$releases" "$current" <<'REMOTE_SH'
 set -euo pipefail
@@ -694,7 +775,7 @@ if [[ ! -d "$staging/$release_id" ]]; then
   exit 1
 fi
 
-# Move into place (atomic enough for our use)
+# Move into place
 rm -rf "$new_release"
 mv "$staging/$release_id" "$new_release"
 
@@ -703,6 +784,7 @@ trap - ERR
 
 # Switch current symlink only after successful install
 ln -sfn "$new_release" "$current"
+
 # Write Prometheus textfile catalogue
 catalogue_file="$releases/version_present.prom"
 current_basename="$(basename "$(readlink "$current")")"
@@ -727,7 +809,7 @@ current_basename="$(basename "$(readlink "$current")")"
 rm -f "$remote_tmp" 2>/dev/null || true
 REMOTE_SH
 
-  log "OK (remote): current -> ${remote_base}/releases/${release_id}"
+  log "OK (remote): current -> ${releases}/$(basename "${release_id}")"
 }
 
 # ---- Main --------------------------------------------------------------------
@@ -743,6 +825,8 @@ main() {
     load_default_services_for_app
     log "Resolved default services: $SERVICES_RAW"
   fi
+
+  load_tenant_for_app
 
   # Always expand transitive dependencies (requires) before building the release.
   RESOLVED_SERVICES_RAW="$(resolve_services_with_requires "$SERVICES_RAW")"

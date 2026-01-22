@@ -25,30 +25,11 @@ die() { log "ERROR: $*"; exit 1; }
 
 # ---- Path resolution ----------------------------------------------------------
 
-# control.sh lives at: <base>/current/bin/control.sh (via symlink), or directly at:
-# <base>/releases/<release_bnid>/bin/control.sh
-#
-# We resolve:
-#   RELEASE_DIR = .../releases/<release_id>
-#   BASE_DIR    = .../sppmon
-#
+# environment.sh lives next to this script and is the single source of truth for
+# release/base paths. control.sh only resolves ENV_FILE and sources it.
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RELEASE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"      # .../<release_id>
-
-# BASE_DIR = parent of releases/ directory
-# Release dir is: <base>/releases/<release_id>
-BASE_DIR="$(cd "$RELEASE_DIR/.." && pwd)"
-
-RELEASE_BIN="$RELEASE_DIR/bin"
-RELEASE_ETC="$RELEASE_DIR/etc"
-RELEASE_LIB="$RELEASE_DIR/lib"
+RELEASE_BIN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="$RELEASE_BIN/environment.sh"
-
-VOLUMES="$BASE_DIR/volumes"
-RUN_DIR="$VOLUMES/run"
-LOG_DIR="$VOLUMES/logs"
-DATA_DIR="$VOLUMES/data"
 
 # ---- Defaults ----------------------------------------------------------------
 
@@ -74,17 +55,17 @@ COMMANDS:
   clean  data --force           DANGEROUS: remove persistent data for this deployment
 
 NOTES:
-  - Runtime services are resolved from: $ENV_FILE
-  - Binaries are under: $RELEASE_LIB
+  - Runtime services are resolved from: $ENV_FILE (SPPMON_RUNTIME_SERVICES)
+  - Binaries are under: $SPPMON_LIB_DIR
   - Entrypoint and flags are defined by SPPMON_ARGS__* in environment.sh
-  - PIDs are stored under: $RUN_DIR
-  - Logs are stored under: $LOG_DIR
+  - PIDs are stored under: $SPPMON_RUN_DIR
+  - Logs are stored under: $SPPMON_LOG_DIR
 
 EOF
 }
 
-pid_file() { echo "$RUN_DIR/$1.pid"; }
-log_file() { echo "$LOG_DIR/$1.log"; }
+pid_file() { echo "$SPPMON_RUN_DIR/$1.pid"; }
+log_file() { echo "$SPPMON_LOG_DIR/$1.log"; }
 
 is_running() {
   local svc="$1"
@@ -96,14 +77,16 @@ is_running() {
 }
 
 ensure_runtime_dirs() {
-  mkdir -p "$RUN_DIR" "$LOG_DIR" "$DATA_DIR"
+  require_environment
+  mkdir -p "$SPPMON_RUN_DIR" "$SPPMON_LOG_DIR" "$SPPMON_DATA_DIR"
 }
 
 # Clear previously loaded SPPMon runtime variables so environment.sh changes are reflected.
 clear_environment_vars() {
+  # Only clear variables that are owned by SPPMon to allow live edits.
+  # Do NOT unset everything in the shell.
   local v
-  # compgen exists in Bash 3+ and lists shell variable names.
-  for v in $(compgen -v | grep '^SPPMON_' || true); do
+  for v in $(compgen -v | grep -E '^(SPPMON_|APP$|ENV$|ENDPOINT_)' || true); do
     unset "$v" 2>/dev/null || true
   done
 }
@@ -118,6 +101,16 @@ require_environment() {
   source "$ENV_FILE"
 
   [[ -n "${SPPMON_RUNTIME_SERVICES:-}" ]] || die "Invalid environment.sh: SPPMON_RUNTIME_SERVICES is not set"
+
+  # Keep compatibility with service args that may reference either the short
+  # names (SPPMON_ETC_DIR, SPPMON_DATA_DIR, ...) or the prefixed ones (SPPMON_DATA_DIR, ...).
+  : "${SPPMON_ETC_DIR:="$SPPMON_ETC_DIR"}"
+  : "${SPPMON_LIB_DIR:="$SPPMON_LIB_DIR"}"
+  : "${SPPMON_DATA_DIR:="$SPPMON_DATA_DIR"}"
+  : "${SPPMON_LOG_DIR:="$SPPMON_LOG_DIR"}"
+  : "${SPPMON_RUN_DIR:="$SPPMON_RUN_DIR"}"
+
+  export SPPMON_ETC_DIR SPPMON_LIB_DIR SPPMON_DATA_DIR SPPMON_LOG_DIR SPPMON_RUN_DIR
 }
 
 safe_key() {
@@ -159,7 +152,7 @@ service_args() {
     if [[ "$a2" = /* ]]; then
       abs="$a2"
     else
-      abs="$RELEASE_DIR/$a2"
+      abs="$SPPMON_RELEASE_DIR/$a2"
     fi
     if [[ -d "$abs" && -f "$abs/config.alloy" ]]; then
       if [[ -n "$rest" ]]; then
@@ -184,7 +177,7 @@ service_binary() {
 
   [[ -n "${bin//[[:space:]]/}" ]] || die "Service '$svc' has no binary defined"
 
-  local path="$RELEASE_LIB/$bin"
+  local path="$SPPMON_LIB_DIR/$bin"
   [[ -x "$path" ]] || die "Binary not found or not executable: $path"
   echo "$path"
 }
@@ -262,7 +255,7 @@ cmd_start() {
 
   # Start in background, capture pid
   # shellcheck disable=SC2086
-  nohup bash -c "cd \"$RELEASE_DIR\" && exec -a \"$proc_name\" \"$bin\" $args" >>"$lf" 2>&1 &
+  nohup bash -c "cd \"$SPPMON_RELEASE_DIR\" && exec -a \"$proc_name\" \"$bin\" $args" >>"$lf" 2>&1 &
   local pid=$!
   echo "$pid" > "$pidf"
 
@@ -365,13 +358,13 @@ cmd_clean() {
 
   case "$what" in
     logs)
-      log "Cleaning logs: $LOG_DIR"
-      rm -f "$LOG_DIR"/*.log 2>/dev/null || true
+      log "Cleaning logs: $SPPMON_LOG_DIR"
+      rm -f "$SPPMON_LOG_DIR"/*.log 2>/dev/null || true
       log "OK: logs cleaned"
       ;;
     run)
-      log "Cleaning runtime pid files: $RUN_DIR"
-      rm -f "$RUN_DIR"/*.pid 2>/dev/null || true
+      log "Cleaning runtime pid files: $SPPMON_RUN_DIR"
+      rm -f "$SPPMON_RUN_DIR"/*.pid 2>/dev/null || true
       log "OK: run files cleaned"
       ;;
     data)
@@ -380,9 +373,9 @@ cmd_clean() {
         force="true"
       fi
       [[ "$force" == "true" ]] || die "Refusing to remove data without --force"
-      log "DANGEROUS: Removing data directory: $DATA_DIR"
-      rm -rf "$DATA_DIR"
-      mkdir -p "$DATA_DIR"
+      log "DANGEROUS: Removing data directory: $SPPMON_DATA_DIR"
+      rm -rf "$SPPMON_DATA_DIR"
+      mkdir -p "$SPPMON_DATA_DIR"
       log "OK: data cleaned"
       ;;
     *)
@@ -396,6 +389,8 @@ cmd_clean() {
 main() {
   local cmd="${1:-}"
   shift || true
+
+  require_environment
 
   case "$cmd" in
     --help|-h|help|"") usage; exit 0 ;;

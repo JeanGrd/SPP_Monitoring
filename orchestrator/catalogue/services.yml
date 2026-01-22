@@ -1,12 +1,26 @@
+# ------------------------------------------------------------------------------
+# SPPMon service catalogue
+#
+# Variables available in service args (expanded at runtime by the shell):
+#   $SPPMON_RELEASE_DIR  = "."                 (release root)
+#   $SPPMON_ETC_DIR      = "etc"               (config dir)
+#   $SPPMON_LIB_DIR      = "lib"               (binary dir)
+#   $SPPMON_VOLUMES_DIR  = "../volumes"        (volumes root)
+#   $SPPMON_DATA_DIR     = "../volumes/data"   (persistent data)
+#   $SPPMON_LOG_DIR      = "../volumes/logs"   (logs)
+#   $SPPMON_RUN_DIR      = "../volumes/run"    (pid files)
+#   $SPPMON_TENANT_ID, $SPPMON_APP, $SPPMON_ENV
+#   $SPPMON_ENDPOINT_MIMIR, $SPPMON_ENDPOINT_LOKI, $SPPMON_ENDPOINT_MINIO
+# ------------------------------------------------------------------------------
+
 services:
-  alloy_agent:
-    description: "Grafana Alloy Agent (runtime)"
+  alloy:
+    description: "Grafana Alloy Agent"
     binaries: ["alloy"]
-    configs: ["alloy_agent", "loki_exporter"]
+    fragments: ["alloy_agent"]
     args: "run --storage.path=$SPPMON_DATA_DIR/alloy/ $SPPMON_ETC_DIR"
 
   loki_exporter:
-    description: "Extra log pipeline (config only)"
-    binaries: []
-    configs: ["loki_exporter"]
+    description: "Extra log pipeline (config only), require alloy services"
+    fragments: ["loki_exporter"]
     requires: ["alloy_agent"]

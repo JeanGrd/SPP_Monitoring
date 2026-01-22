@@ -1,9 +1,9 @@
 envs:
   UAT:
     endpoint:
-      mimir: ""
-      minio: ""
-      loki: ""
+      mimir: "UAT MIMIR"
+      minio: "UAT MINIO"
+      loki: "UAT LOKI"
 
     infra-hosts:
       - "infra-uat-1"
@@ -11,9 +11,9 @@ envs:
 
   PRD:
     endpoint:
-      mimir: ""
-      minio: ""
-      loki: ""
+      mimir: "PRD MIMIR"
+      minio: "PRD MINIO"
+      loki: "PRD LOKI"
 
     infra-hosts:
       - "infra-uat-1"

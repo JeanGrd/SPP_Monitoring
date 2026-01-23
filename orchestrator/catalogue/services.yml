@@ -18,7 +18,7 @@ services:
     description: "Grafana Alloy Agent"
     binaries: ["alloy"]
     fragments: ["alloy_agent"]
-    args: "run --storage.path=$SPPMON_DATA_DIR/alloy/ $SPPMON_ETC_DIR"
+    args: "run --storage.path=$SPPMON_DATA_DIR/alloy/ $SPPMON_ETC_DIR --server.http.listen-addr=0.0.0.0:8121"
 
   loki_exporter:
     description: "Extra log pipeline (config only), require alloy services"

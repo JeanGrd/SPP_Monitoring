@@ -10,7 +10,7 @@ set -euo pipefail
 #
 # Simulation (no SSH):
 #   If --remote is NOT provided, targets are treated as simulated hosts under:
-#     <repo>/host/<target><REMOTE_BASE>/
+#     <repo>/hosts/<target>/SPP_Monitoring/
 #
 # Remote mode (SSH):
 #   Not enabled here yet (placeholder), but the CLI flag exists.
@@ -22,7 +22,7 @@ LIB_DIR="$(cd "$SCRIPT_DIR/../lib" && pwd)"
 # shellcheck source=../lib/utils.sh
 source "$LIB_DIR/utils.sh"
 
-DEFAULT_REMOTE_BASE="/sppmon"
+DEFAULT_REMOTE_BASE="/SPP_Monitoring"
 
 ROOT=""
 APP=""
@@ -56,7 +56,7 @@ OPTIONAL:
   --help               Show this help
 
 NOTES:
-  - If --remote is NOT provided, rollback runs in simulation mode under <repo>/host/<target>/...
+  - If --remote is NOT provided, rollback runs in simulation mode under <repo>/hosts/<target>/SPP_Monitoring/
   - After switching `current`, this updates releases/version_present.prom for dashboards.
   - --previous requires at least two releases on disk.
   - --latest requires at least one release on disk.
@@ -152,7 +152,7 @@ list_releases() {
   local current_release="$2"
 
   if [[ ! -d "$releases_dir" ]]; then
-    echo "(no releases directory)"
+    echo "(no releases directory: $releases_dir)"
     return
   fi
 
@@ -213,15 +213,17 @@ rollback_simulated_host() {
   local simulated_host_root="$ROOT/hosts/$target_name"
   local remote_base="${SPPMON_REMOTE_BASE:-$DEFAULT_REMOTE_BASE}"
 
-  # Layout: <repo>/host/<target><REMOTE_BASE>/{releases,current}
+  # Expected layout: <root>/hosts/<target>/SPP_Monitoring/{releases,current,volumes}
   local base="$simulated_host_root$remote_base"
   [[ "$base" == "$simulated_host_root"* ]] || die "Refusing to operate outside simulated host root: base=$base"
 
   local releases_dir="$base/releases"
   local current_link="$base/current"
 
-  local current_release
-  current_release="$(get_current_release "$current_link")"
+  local current_release=""
+  if [[ -L "$current_link" ]]; then
+    current_release="$(get_current_release "$current_link")"
+  fi
 
   if [[ "$LIST_ONLY" == "true" ]]; then
     echo ""

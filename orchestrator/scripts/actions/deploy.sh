@@ -31,17 +31,18 @@ TARGETS_RAW=""
 SERVICES_RAW=""
 RESOLVED_SERVICES_RAW=""
 ENABLE_REMOTE="false"
-STRICT_MODE="false"
 CATALOGUE_DIR=""
 YQ_BIN=""
 TENANT=""
+SERVICES_STRIPPED_RAW=""
+SERVICE_VERSION_OVERRIDES=""  # space-separated svc=version
 
 print_help() {
   cat <<'EOF'
 deploy.sh - Build and deploy a release
 
 USAGE:
-  deploy.sh --root <path> --app <APP> --env <ENV> --targets <list> [--services <list>] [--remote] [--strict]
+  deploy.sh --root <path> --app <APP> --env <ENV> --targets <list> [--services <list>] [--remote]
 
 REQUIRED:
   --root <path>        Repository root (passed by sppmon)
@@ -52,18 +53,71 @@ REQUIRED:
 OPTIONAL:
   --remote             Enable SSH/SCP remote deployment (disabled by default)
                        Uses SSH/SCP for deployment; expects key-based authentication.
-  --strict             Fail build if any requested service template/binary is missing
-  --services <list>    Comma-separated services to include (overrides app defaults)
+  --services <list>    Comma-separated services to include (supports svc@version, e.g. "alloy@1.3,loki_exporter")
   --help               Show this help
 
 NOTES:
   - Fragments are packaged under: etc/ (flattened copy of <root>/catalogue/templates/<fragment>/ contents).
   - Fragments are selected from:   catalogue/services.yml -> services.<service>.fragments
-  - Binaries are sourced from:   <root>/bin/<name> and packaged under lib/ in the release.
+  - Binaries are sourced from: <root>/bin/<binary>/<version>/<binary> where version is either provided via svc@version or the service's binary.default_version in services.yml.
   - If --remote is NOT provided, ALL targets are treated as local simulations under <root>/hosts/<target>/...
   - Simulation writes <root>/hosts/<target><REMOTE_BASE>/releases/version_present.prom for catalogue/current tracking.
   - Each release includes: bin/control.sh, bin/readme.txt (usage guide), and bin/environment.sh (machine-readable service runtime info).
 EOF
+}
+parse_services_and_versions() {
+  # Input: SERVICES_RAW (comma-separated, possibly with svc@version)
+  # Output: sets SERVICES_STRIPPED_RAW (comma-separated), SERVICE_VERSION_OVERRIDES (space-separated svc=version)
+  SERVICES_STRIPPED_RAW=""
+  SERVICE_VERSION_OVERRIDES=""
+  local input="$SERVICES_RAW"
+  local IFS=',' entry svc ver
+  for entry in $input; do
+    entry="$(echo "$entry" | xargs 2>/dev/null)"  # trim spaces
+    if [[ "$entry" == *"@"* ]]; then
+      svc="${entry%%@*}"
+      ver="${entry#*@}"
+      if [[ -z "$svc" ]]; then
+        die "Invalid service entry (empty service name): '$entry'"
+      fi
+      if [[ -n "$SERVICES_STRIPPED_RAW" ]]; then
+        SERVICES_STRIPPED_RAW="$SERVICES_STRIPPED_RAW,$svc"
+      else
+        SERVICES_STRIPPED_RAW="$svc"
+      fi
+      if [[ -n "$ver" ]]; then
+        if [[ -n "$SERVICE_VERSION_OVERRIDES" ]]; then
+          SERVICE_VERSION_OVERRIDES="$SERVICE_VERSION_OVERRIDES $svc=$ver"
+        else
+          SERVICE_VERSION_OVERRIDES="$svc=$ver"
+        fi
+      fi
+    else
+      svc="$entry"
+      if [[ -z "$svc" ]]; then
+        die "Invalid service entry (empty service name): '$entry'"
+      fi
+      if [[ -n "$SERVICES_STRIPPED_RAW" ]]; then
+        SERVICES_STRIPPED_RAW="$SERVICES_STRIPPED_RAW,$svc"
+      else
+        SERVICES_STRIPPED_RAW="$svc"
+      fi
+    fi
+  done
+}
+
+get_service_version_override() {
+  # Usage: get_service_version_override <svc>
+  # Output: echo version if present in SERVICE_VERSION_OVERRIDES, else echo empty
+  local svc="$1"
+  local pair
+  for pair in $SERVICE_VERSION_OVERRIDES; do
+    if [[ "$pair" == "$svc="* ]]; then
+      echo "${pair#*=}"
+      return 0
+    fi
+  done
+  echo ""
 }
 
 # ---- Argument parsing --------------------------------------------------------
@@ -77,7 +131,6 @@ parse_args() {
       --targets)  TARGETS_RAW="${2:-}"; shift 2 ;;
       --services) SERVICES_RAW="${2:-}"; shift 2 ;;
       --remote)   ENABLE_REMOTE="true"; shift ;;
-      --strict)   STRICT_MODE="true"; shift ;;
       --help|-h)  print_help; exit 0 ;;
       *) die "Unknown argument: $1 (use --help)" ;;
     esac
@@ -201,10 +254,9 @@ load_tenant_for_app() {
     return 0
   fi
 
-  log "$TENANT"
-
   die "No tenant found for app '$APP' env '$ENV_NAME' in $apps_file (expected: apps.<APP>.tenants.<ENV>)"
 }
+
 
 load_service_requires() {
   # Reads services.<service>.requires from catalogue/services.yml.
@@ -220,6 +272,51 @@ load_service_requires() {
     return 0
   fi
   echo "$value"
+}
+
+
+# --- Helper: read binary for a service as name|version (single line) ---
+yq_read_service_binary() {
+  # Usage: yq_read_service_binary <svc>
+  # Output: name|version (version resolved: override -> default_version)
+  local svc="$1"
+  local services_file="$CATALOGUE_DIR/services.yml"
+  [[ -f "$services_file" ]] || die "services.yml not found: $services_file"
+  local yq="$YQ_BIN"
+
+  local name default_version available_versions override_version version
+
+  name="$($yq -r ".services.\"$svc\".binary.name // \"\"" "$services_file" 2>/dev/null || true)"
+  [[ "$name" == "null" ]] && name=""
+  # If no binary declared, return empty (config-only service)
+  if [[ -z "${name//[[:space:]]/}" ]]; then
+    echo ""
+    return 0
+  fi
+
+  default_version="$($yq -r ".services.\"$svc\".binary.default_version // \"\"" "$services_file" 2>/dev/null || true)"
+  [[ "$default_version" == "null" ]] && default_version=""
+
+  override_version="$(get_service_version_override "$svc")"
+  version="$override_version"
+  if [[ -z "${version//[[:space:]]/}" ]]; then
+    version="$default_version"
+  fi
+
+  [[ -n "${version//[[:space:]]/}" ]] || die "Missing version for binary '$name' in service '$svc' (expected .binary.default_version in $services_file or svc@version override)"
+
+  available_versions="$($yq -r ".services.\"$svc\".binary.available_versions // [] | join(\",\")" "$services_file" 2>/dev/null || true)"
+  [[ "$available_versions" == "null" ]] && available_versions=""
+  if [[ -n "${available_versions//[[:space:]]/}" ]]; then
+    local ok="no" av
+    IFS=',' read -r -a _avs <<< "$available_versions"
+    for av in "${_avs[@]}"; do
+      [[ "$av" == "$version" ]] && ok="yes"
+    done
+    [[ "$ok" == "yes" ]] || die "Version '$version' for binary '$name' in service '$svc' not found in available_versions ($available_versions)"
+  fi
+
+  echo "${name}|${version}"
 }
 
 
@@ -374,11 +471,7 @@ EOF
     dest="$pkg_dir/etc/$base"
 
     if [[ -e "$dest" ]]; then
-      if [[ "$STRICT_MODE" == "true" ]]; then
-        die "Strict mode: template collision: '$base' already exists in etc/"
-      fi
-      warn "Template collision: '$base' already exists in etc/ (overwriting, non-strict mode)."
-      rm -rf "$dest" 2>/dev/null || true
+      die "Template collision: '$base' already exists in etc/"
     fi
 
     cp -R "$src_path" "$pkg_dir/etc/"
@@ -401,37 +494,31 @@ EOF
       done
       shopt -u nullglob dotglob
     else
-      # Only warn if the fragment was declared, not if a service has no fragments.
-      if [[ "$STRICT_MODE" == "true" ]]; then
-        die "Strict mode: missing fragment template directory for fragment '$fragment' (expected: $CATALOGUE_DIR/templates/$fragment)"
-      fi
-      warn "Missing fragment template directory for fragment '$fragment' (expected: $CATALOGUE_DIR/templates/$fragment). Continuing (non-strict mode)."
+      die "Missing fragment template directory for fragment '$fragment' (expected: $CATALOGUE_DIR/templates/$fragment)"
     fi
   done
 
-  # Copy binaries as declared in catalogue/services.yml:
-  #   services.<service>.binaries: ["alloy", ...]
-  # This avoids assuming binary name == service name and supports config-only services (binaries: []).
-  local bin_list bin_name
+  # Copy binaries as declared in catalogue/services.yml (version-aware):
+  #   services.<service>.binary: {name, default_version, ...}
   for svc in $(normalize_list "$RESOLVED_SERVICES_RAW"); do
-    # Always treat missing binaries as empty list (config-only allowed)
-    bin_list="$($YQ_BIN -r ".services.\"$svc\".binaries // [] | join(\",\")" "$services_file" 2>/dev/null || true)"
-    [[ "$bin_list" == "null" ]] && bin_list=""
-    # Config-only service: no binaries to ship.
-    if [[ -z "$(echo "$bin_list" | tr -d '[:space:]')" ]]; then
+    # Skip unknown entries (can happen if a requirement references a fragment name).
+    if [[ "$($YQ_BIN -r ".services.\"$svc\" | type" "$services_file" 2>/dev/null || true)" == "null" ]]; then
       continue
     fi
-    for bin_name in $(normalize_list "$bin_list"); do
-      if [[ -f "$ROOT/bin/$bin_name" ]]; then
-        cp "$ROOT/bin/$bin_name" "$pkg_dir/lib/$bin_name"
-        chmod +x "$pkg_dir/lib/$bin_name" || true
-      else
-        if [[ "$STRICT_MODE" == "true" ]]; then
-          die "Strict mode: missing binary '$bin_name' for service '$svc' (expected: <repo>/bin/$bin_name)"
-        fi
-        warn "Missing binary '$bin_name' for service '$svc' (expected: <repo>/bin/$bin_name). Continuing (non-strict mode)."
-      fi
-    done
+    line="$(yq_read_service_binary "$svc")"
+    if [[ -z "$line" ]]; then
+      continue
+    fi
+    bin_name="${line%%|*}"
+    bin_version="${line#*|}"
+    [[ -z "$bin_name" || -z "$bin_version" ]] && continue
+    src="$ROOT/bin/$bin_name/$bin_version/$bin_name"
+    if [[ -f "$src" ]]; then
+      cp "$src" "$pkg_dir/lib/$bin_name"
+      chmod +x "$pkg_dir/lib/$bin_name" || true
+    else
+      die "Missing binary '$bin_name' version '$bin_version' for service '$svc' (expected: $src)"
+    fi
   done
 
   # Include runtime control plane (shipped with every release)
@@ -443,16 +530,10 @@ EOF
     if [[ -f "$ROOT/scripts/runtime/environment.sh" ]]; then
       cp "$ROOT/scripts/runtime/environment.sh" "$pkg_dir/bin/environment.sh"
     else
-      if [[ "$STRICT_MODE" == "true" ]]; then
-        die "Strict mode: missing shared runtime environment script (expected: $ROOT/scripts/runtime/environment.sh)"
-      fi
-      warn "Missing shared runtime environment script (expected: $ROOT/scripts/runtime/environment.sh). Continuing (non-strict mode)."
+      die "Missing shared runtime environment script (expected: $ROOT/scripts/runtime/environment.sh)"
     fi
   else
-    if [[ "$STRICT_MODE" == "true" ]]; then
-      die "Strict mode: missing runtime control script (expected: $ROOT/scripts/runtime/control.sh)"
-    fi
-    warn "Missing runtime control script (expected: $ROOT/scripts/runtime/control.sh). Continuing (non-strict mode)."
+    die "Missing runtime control script (expected: $ROOT/scripts/runtime/control.sh)"
   fi
 
   if [[ -f "$ROOT/scripts/runtime/readme.txt" ]]; then
@@ -460,10 +541,7 @@ EOF
   elif [[ -f "$ROOT/scripts/runtime/CONTROL.txt" ]]; then
     cp "$ROOT/scripts/runtime/CONTROL.txt" "$pkg_dir/bin/CONTROL.txt"
   else
-    if [[ "$STRICT_MODE" == "true" ]]; then
-      die "Strict mode: missing control documentation (expected: $ROOT/scripts/runtime/readme.txt or CONTROL.txt)"
-    fi
-    warn "Missing control documentation (expected: $ROOT/scripts/runtime/readme.txt or CONTROL.txt). Continuing (non-strict mode)."
+    die "Missing control documentation (expected: $ROOT/scripts/runtime/readme.txt or CONTROL.txt)"
   fi
 
 
@@ -481,7 +559,7 @@ EOF
   fi
 
   # --- Compute runtime (launchable) services once so we can reuse them for environment.sh and manifest. ---
-  # Runtime services = services present in catalogue/services.yml with a non-empty first binary.
+  # Runtime services = services present in catalogue/services.yml with a non-empty .binary.name.
   local runtime_line
   runtime_line=""
 
@@ -491,7 +569,7 @@ EOF
       _exists="$($YQ_BIN -r ".services.\"${_svc}\" | type" "$services_file" 2>/dev/null || true)"
       [[ -z "$_exists" || "$_exists" == "null" ]] && continue
 
-      _bin0="$($YQ_BIN -r ".services.\"${_svc}\".binaries[0] // \"\"" "$services_file" 2>/dev/null || true)"
+      _bin0="$($YQ_BIN -r ".services.\"${_svc}\".binary.name // \"\"" "$services_file" 2>/dev/null || true)"
       [[ "$_bin0" == "null" ]] && _bin0=""
       [[ -z "${_bin0//[[:space:]]/}" ]] && continue
 
@@ -537,7 +615,7 @@ EOF
     for svc in $runtime_line; do
       safe="$(echo "$svc" | sed -E 's/[^A-Za-z0-9_]/_/g')"
 
-      primary_bin="$($YQ_BIN -r ".services.\"$svc\".binaries[0] // \"\"" "$services_file" 2>/dev/null || true)"
+      primary_bin="$($YQ_BIN -r ".services.\"$svc\".binary.name // \"\"" "$services_file" 2>/dev/null || true)"
       [[ "$primary_bin" == "null" ]] && primary_bin=""
 
       args="$($YQ_BIN -r ".services.\"$svc\".args // \"\"" "$services_file" 2>/dev/null || true)"
@@ -580,17 +658,17 @@ EOF
 
     echo "Services"
     # List runtime services only (launchable = has binaries)
-    local svc desc bins_csv bins_space
+    local svc desc
     for svc in $runtime_line; do
       desc="$($YQ_BIN -r ".services.\"$svc\".description // \"\"" "$services_file" 2>/dev/null || true)"
       [[ "$desc" == "null" ]] && desc=""
       echo "$svc: $desc"
-
-      bins_csv="$($YQ_BIN -r ".services.\"$svc\".binaries // [] | join(\",\")" "$services_file" 2>/dev/null || true)"
-      [[ "$bins_csv" == "null" ]] && bins_csv=""
-      bins_space="$(echo "$bins_csv" | tr ',' ' ' | xargs 2>/dev/null || true)"
-      if [[ -n "${bins_space//[[:space:]]/}" ]]; then
-        echo "  binaries: $bins_space"
+      local line
+      line="$(yq_read_service_binary "$svc")"
+      if [[ -n "$line" ]]; then
+        bin_name="${line%%|*}"
+        bin_version="${line#*|}"
+        echo "  binary: ${bin_name}@${bin_version}"
       fi
     done
     echo
@@ -828,8 +906,9 @@ main() {
 
   load_tenant_for_app
 
-  # Always expand transitive dependencies (requires) before building the release.
-  RESOLVED_SERVICES_RAW="$(resolve_services_with_requires "$SERVICES_RAW")"
+  # Parse services and versions, then expand transitive dependencies (requires) before building the release.
+  parse_services_and_versions
+  RESOLVED_SERVICES_RAW="$(resolve_services_with_requires "$SERVICES_STRIPPED_RAW")"
   log "Resolved services (with requires): $RESOLVED_SERVICES_RAW"
 
   local result release_id tarball work_dir

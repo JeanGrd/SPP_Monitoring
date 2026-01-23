@@ -16,7 +16,10 @@
 services:
   alloy:
     description: "Grafana Alloy Agent"
-    binaries: ["alloy"]
+    binary:
+      name: "alloy"
+      default_version: "1.2"
+      available_versions: ["1.2", "1.3"]
     fragments: ["alloy_agent"]
     args: "run --storage.path=$SPPMON_DATA_DIR/alloy/ $SPPMON_ETC_DIR --server.http.listen-addr=0.0.0.0:8121"
 

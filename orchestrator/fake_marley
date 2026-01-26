@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ----------------------------
+# Fake Marley (test only)
+# ----------------------------
+
+SEP=","
+HEADER="false"
+
+FILTER_MAIN_APP=""
+FILTER_ENV=""
+FILTER_FQDN=""
+
+# Fake static inventory (1 host)
+MAIN_APP="ICOM"
+ENVIRONMENT="UAT"
+FQDN="172.20.10.4"
+OS_NAME="linux"
+
+# ----------------------------
+# Parse args
+# ----------------------------
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -F)
+      SEP="$2"
+      shift 2
+      ;;
+    -H)
+      HEADER="true"
+      shift
+      ;;
+    --main_app)
+      FILTER_MAIN_APP="$2"
+      shift 2
+      ;;
+    --environment)
+      FILTER_ENV="$2"
+      shift 2
+      ;;
+    --FQDN)
+      FILTER_FQDN="$2"
+      shift 2
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+# Remaining argument = requested columns
+COLUMNS_RAW="${1:-}"
+[[ -n "$COLUMNS_RAW" ]] || {
+  echo "marley: missing column list" >&2
+  exit 1
+}
+
+# Normalize columns
+IFS=',' read -r -a COLUMNS <<<"$(echo "$COLUMNS_RAW" | tr -d ' ')"
+
+# ----------------------------
+# Apply filters
+# ----------------------------
+[[ -n "$FILTER_MAIN_APP" && "$FILTER_MAIN_APP" != "$MAIN_APP" ]] && exit 0
+[[ -n "$FILTER_ENV" && "$FILTER_ENV" != "$ENVIRONMENT" ]] && exit 0
+[[ -n "$FILTER_FQDN" && "$FILTER_FQDN" != "$FQDN" ]] && exit 0
+
+# ----------------------------
+# Output
+# ----------------------------
+if [[ "$HEADER" == "true" ]]; then
+  printf "%s\n" "$(IFS="$SEP"; echo "${COLUMNS[*]}")"
+fi
+
+values=()
+for col in "${COLUMNS[@]}"; do
+  case "$col" in
+    main_app)     values+=("$MAIN_APP") ;;
+    environment)  values+=("$ENVIRONMENT") ;;
+    fqdn)         values+=("$FQDN") ;;
+    os_name)      values+=("$OS_NAME") ;;
+    *)
+      values+=("")
+      ;;
+  esac
+done
+
+printf "%s\n" "$(IFS="$SEP"; echo "${values[*]}")"

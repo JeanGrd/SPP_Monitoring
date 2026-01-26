@@ -40,9 +40,6 @@ USAGE:
   rollback.sh --root <path> --app <APP> --env <ENV> --targets <list> (--release <RELEASE_ID> | --previous | --latest | --list)
 
 REQUIRED:
-  --root <path>        Repository root (passed by sppmon)
-  --app <name>         Application name (ICOM, Jaguar, ...)
-  --env <name>         Environment (UAT, PRD, ...)
   --targets <list>     Comma-separated targets (e.g. "188.23.34.10,188.23.34.11")
 
 ACTIONS:
@@ -64,9 +61,6 @@ EOF
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --root)     ROOT="${2:-}"; shift 2 ;;
-      --app)      APP="${2:-}"; shift 2 ;;
-      --env)      ENV_NAME="${2:-}"; shift 2 ;;
       --targets)  TARGETS_RAW="${2:-}"; shift 2 ;;
       --release)  RELEASE_ID="${2:-}"; shift 2 ;;
       --list)     LIST_ONLY="true"; shift ;;

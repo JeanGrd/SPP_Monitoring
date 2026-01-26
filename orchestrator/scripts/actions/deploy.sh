@@ -4,8 +4,8 @@ set -euo pipefail
 # ------------------------------------------------------------------------------
 # deploy.sh
 # Responsibilities:
-# - Build a release tarball (bin + fragments + metadata)
-# - Deploy it to one or more targets
+# - Build a release tarball (binaries + fragments + metadata)
+# - Deploy it to one or more targets over SSH/SCP
 # ------------------------------------------------------------------------------
 
 # shellcheck disable=SC2164
@@ -16,9 +16,8 @@ source "$LIB_DIR/utils.sh"
 
 # ---- Defaults ----------------------------------------------------------------
 
-# Default deploy base directory (under each host). Can be overridden with SPPMON_REMOTE_BASE.
-# - Simulation: <root>/hosts/<target>/<REMOTE_BASE>/...
-# - Remote:     <remote_login_dir>/<REMOTE_BASE>/...
+# Default deploy base directory (relative to the remote login directory).
+# Can be overridden with SPPMON_REMOTE_BASE.
 DEFAULT_REMOTE_BASE="SPP_Monitoring"
 SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 
@@ -30,7 +29,6 @@ ENV_NAME=""
 TARGETS_RAW=""
 SERVICES_RAW=""
 RESOLVED_SERVICES_RAW=""
-ENABLE_REMOTE="false"
 CATALOGUE_DIR=""
 YQ_BIN=""
 TENANT=""
@@ -42,7 +40,7 @@ print_help() {
 deploy.sh - Build and deploy a release
 
 USAGE:
-  deploy.sh --root <path> --app <APP> --env <ENV> --targets <list> [--services <list>] [--remote]
+  deploy.sh --root <path> --app <APP> --env <ENV> --targets <list> [--services <list>]
 
 REQUIRED:
   --root <path>        Repository root (passed by sppmon)
@@ -51,17 +49,13 @@ REQUIRED:
   --targets <list>     Comma-separated targets (e.g. "188.23.34.10,188.23.34.11")
 
 OPTIONAL:
-  --remote             Enable SSH/SCP remote deployment (disabled by default)
-                       Uses SSH/SCP for deployment; expects key-based authentication.
   --services <list>    Comma-separated services to include (supports svc@version, e.g. "alloy@1.3,loki_exporter")
   --help               Show this help
 
 NOTES:
   - Fragments are packaged under: etc/ (flattened copy of <root>/catalogue/templates/<fragment>/ contents).
   - Fragments are selected from:   catalogue/services.yml -> services.<service>.fragments
-  - Binaries are sourced from: <root>/bin/<binary>/<version>/<binary> where version is either provided via svc@version or the service's binary.default_version in services.yml.
-  - If --remote is NOT provided, ALL targets are treated as local simulations under <root>/hosts/<target>/...
-  - Simulation writes <root>/hosts/<target><REMOTE_BASE>/releases/version_present.prom for catalogue/current tracking.
+  - Binaries are sourced from: <root>/bin/<binary>/<version>/<binary> (version comes from svc@version or services.yml: services.<service>.binary.default_version).
   - Each release includes: bin/control.sh, bin/readme.txt (usage guide), and bin/environment.sh (machine-readable service runtime info).
 EOF
 }
@@ -130,7 +124,6 @@ parse_args() {
       --env)      ENV_NAME="${2:-}"; shift 2 ;;
       --targets)  TARGETS_RAW="${2:-}"; shift 2 ;;
       --services) SERVICES_RAW="${2:-}"; shift 2 ;;
-      --remote)   ENABLE_REMOTE="true"; shift ;;
       --help|-h)  print_help; exit 0 ;;
       *) die "Unknown argument: $1 (use --help)" ;;
     esac
@@ -152,10 +145,8 @@ validate_args() {
   require_cmd rm
   require_cmd mv
   require_cmd readlink
-  if [[ "$ENABLE_REMOTE" == "true" ]]; then
-    require_cmd ssh
-    require_cmd scp
-  fi
+  require_cmd ssh
+  require_cmd scp
   CATALOGUE_DIR="$ROOT/catalogue"
   [[ -d "$CATALOGUE_DIR" ]] || die "catalogue directory not found: $CATALOGUE_DIR"
 }
@@ -703,92 +694,6 @@ normalize_remote_base_rel() {
   echo "$b"
 }
 
-normalize_remote_base_sim() {
-  # Simulation base directory to append under <root>/hosts/<target>.
-  # Accepts either "SPP_Monitoring" or "/SPP_Monitoring"; returns a path starting with '/'.
-  local b="${SPPMON_REMOTE_BASE:-$DEFAULT_REMOTE_BASE}"
-  b="${b%/}"
-  b="/${b#/}"
-  [[ -n "${b//[[:space:]]/}" && "$b" != "/" ]] || die "Simulation base directory is empty (SPPMON_REMOTE_BASE/DEFAULT_REMOTE_BASE)"
-  echo "$b"
-}
-
-write_release_catalogue_local() {
-  # Writes releases/version_present.prom for the given releases dir and current symlink.
-  local releases_dir="$1"
-  local current_link="$2"
-
-  local catalogue_file current_basename
-  catalogue_file="$releases_dir/version_present.prom"
-  current_basename="$(basename "$(readlink "$current_link")")"
-
-  {
-    echo "# HELP sppmon_release Release catalogue (1 = present on disk). Label current=\"true\" marks the active release."
-    echo "# TYPE sppmon_release gauge"
-
-    local d
-    for d in "$releases_dir"/*; do
-      [[ -d "$d" ]] || continue
-      [[ "$(basename "$d")" == .* ]] && continue
-
-      if [[ "$(basename "$d")" == "$current_basename" ]]; then
-        echo "sppmon_release{release=\"$(basename "$d")\",current=\"true\"} 1"
-      else
-        echo "sppmon_release{release=\"$(basename "$d")\",current=\"false\"} 1"
-      fi
-    done
-  } > "$catalogue_file"
-
-  log "Wrote release catalogue: $catalogue_file"
-}
-
-# ---- Local simulation deploy -------------------------------------------------
-
-deploy_simulated_host() {
-  local target_name="$1"
-  local release_id="$2"
-  local tarball="$3"
-
-  # ---- Initialize layout paths (simulation) ----------------------------------
-  local simulated_host_root remote_base base
-  local releases volumes current
-  local staging new_release
-
-  simulated_host_root="$ROOT/hosts/$target_name"
-  remote_base="$(normalize_remote_base_sim)"
-
-  # Final base path (simulation): <root>/hosts/<target>/<REMOTE_BASE>
-  base="$simulated_host_root$remote_base"
-  [[ "$base" == "$simulated_host_root"* ]] || die "Refusing to deploy outside simulated host root: base=$base"
-
-  releases="$base/releases"
-  volumes="$base/volumes"
-  current="$base/current"
-
-  staging="$releases/.staging_${release_id}"
-  new_release="$releases/$release_id"
-
-  # ---- Actions ---------------------------------------------------------------
-  rm -rf "$staging"
-  mkdir -p "$staging" "$volumes/data" "$volumes/logs" "$volumes/run"
-
-  cleanup_staging() { rm -rf "$staging" || true; }
-  trap cleanup_staging ERR
-
-  tar -xzf "$tarball" -C "$staging"
-  [[ -d "$staging/$release_id" ]] || die "Local extract failed: $staging/$release_id not found"
-
-  rm -rf "$new_release"
-  mv "$staging/$release_id" "$new_release"
-
-  rm -rf "$staging"
-  trap - ERR
-
-  ln -sfn "$new_release" "$current"
-  log "OK (simulation): current -> $(readlink "$current")"
-
-  write_release_catalogue_local "$releases" "$current"
-}
 
 # ---- Remote deployment -------------------------------------------------------
 
@@ -806,6 +711,8 @@ deploy_remote_host() {
   [[ -n "${ssh_user//[[:space:]]/}" ]] || die "Remote deploy requires TENANT (SSH user) resolved from catalogue/apps.yml"
 
   remote_host="$target_name"
+
+  ssh_user="jean"
   remote_dest="$ssh_user@$target_name"
 
   base="$(normalize_remote_base_rel)"
@@ -832,6 +739,9 @@ release_id="$1"
 remote_tmp="$2"
 releases="$3"
 current="$4"
+
+# Base directory is the parent of the releases/ directory.
+base_dir="$(dirname "$releases")"
 
 staging="$releases/.staging_${release_id}"
 new_release="$releases/$release_id"
@@ -860,12 +770,14 @@ mv "$staging/$release_id" "$new_release"
 rm -rf "$staging"
 trap - ERR
 
-# Switch current symlink only after successful install
-ln -sfn "$new_release" "$current"
+# Switch current symlink only after successful install.
+# IMPORTANT: create the symlink target relative to base_dir to avoid nesting paths like
+# "SPP_Monitoring/current -> SPP_Monitoring/releases/..." which resolves incorrectly.
+ln -sfn "releases/$release_id" "$base_dir/current"
 
 # Write Prometheus textfile catalogue
 catalogue_file="$releases/version_present.prom"
-current_basename="$(basename "$(readlink "$current")")"
+current_basename="$(basename "$(readlink "$base_dir/current")")"
 
 {
   echo "# HELP sppmon_release Release catalogue (1 = present on disk). Label current=\"true\" marks the active release."
@@ -920,11 +832,7 @@ main() {
   local host
   for host in $(normalize_list "$TARGETS_RAW"); do
     log "Deploy target: $host"
-    if [[ "$ENABLE_REMOTE" == "true" ]]; then
-      deploy_remote_host "$host" "$release_id" "$tarball"
-    else
-      deploy_simulated_host "$host" "$release_id" "$tarball"
-    fi
+    deploy_remote_host "$host" "$release_id" "$tarball"
   done
   rm -rf "$work_dir"
   log "Deploy completed for release: $release_id"

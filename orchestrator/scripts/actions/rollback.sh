@@ -5,15 +5,14 @@ set -euo pipefail
 # rollback.sh
 #
 # Responsibilities:
-# - Switch the `current` symlink to a specified release
-# - Refresh the Prometheus inventory file (version_present.prom)
+# - Switch the `current` symlink to a specified release on remote targets
+# - Refresh the Prometheus catalogue index file (releases/version_present.prom)
 #
-# Simulation (no SSH):
-#   If --remote is NOT provided, targets are treated as simulated hosts under:
-#     <repo>/hosts/<target>/SPP_Monitoring/
-#
-# Remote mode (SSH):
-#   Not enabled here yet (placeholder), but the CLI flag exists.
+# Remote layout (relative to the remote login directory by default):
+#   SPP_Monitoring/
+#     current -> releases/<release_id>
+#     releases/<release_id>/...
+#     volumes/...
 # ------------------------------------------------------------------------------
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -22,7 +21,7 @@ LIB_DIR="$(cd "$SCRIPT_DIR/../lib" && pwd)"
 # shellcheck source=../lib/utils.sh
 source "$LIB_DIR/utils.sh"
 
-DEFAULT_REMOTE_BASE="/SPP_Monitoring"
+DEFAULT_REMOTE_BASE="SPP_Monitoring"
 
 ROOT=""
 APP=""
@@ -32,14 +31,13 @@ RELEASE_ID=""
 LIST_ONLY="false"
 USE_PREVIOUS="false"
 USE_LATEST="false"
-ENABLE_REMOTE="false"
 
 print_help() {
   cat <<'EOF'
-rollback.sh - Switch the active release (rollback)
+rollback.sh - Switch the active release on remote targets
 
 USAGE:
-  rollback.sh --root <path> --app <APP> --env <ENV> --targets <list> (--release <RELEASE_ID> | --previous | --latest | --list) [--remote]
+  rollback.sh --root <path> --app <APP> --env <ENV> --targets <list> (--release <RELEASE_ID> | --previous | --latest | --list)
 
 REQUIRED:
   --root <path>        Repository root (passed by sppmon)
@@ -47,19 +45,19 @@ REQUIRED:
   --env <name>         Environment (UAT, PRD, ...)
   --targets <list>     Comma-separated targets (e.g. "188.23.34.10,188.23.34.11")
 
-OPTIONAL:
-  --release <id>       Release ID to activate (must exist under releases/)
+ACTIONS:
+  --release <id>       Activate the given release ID
+  --previous           Activate the most recent release that is OLDER than the current one
+  --latest             Activate the most recent release (switch back to latest)
   --list               List available releases and show which one is active
-  --previous           Activate the most recent release that is NOT current
-  --latest             Activate the most recent release (equivalent to "switch back to latest")
-  --remote             Enable SSH rollback (placeholder for later)
+
+OTHER:
   --help               Show this help
 
 NOTES:
-  - If --remote is NOT provided, rollback runs in simulation mode under <repo>/hosts/<target>/SPP_Monitoring/
-  - After switching `current`, this updates releases/version_present.prom for dashboards.
-  - --previous requires at least two releases on disk.
-  - --latest requires at least one release on disk.
+  - Rollback is performed over SSH using the tenant/user resolved from catalogue/apps.yml (apps.<APP>.tenants.<ENV>).
+  - The current symlink is always set as: current -> releases/<release_id> (relative link).
+  - After switching `current`, this updates releases/version_present.prom.
 EOF
 }
 
@@ -74,7 +72,6 @@ parse_args() {
       --list)     LIST_ONLY="true"; shift ;;
       --previous) USE_PREVIOUS="true"; shift ;;
       --latest)   USE_LATEST="true"; shift ;;
-      --remote)   ENABLE_REMOTE="true"; shift ;;
       --help|-h)  print_help; exit 0 ;;
       *) die "Unknown argument: $1 (use --help)" ;;
     esac
@@ -104,42 +101,97 @@ validate_args() {
     die "--latest cannot be combined with --release"
   fi
 
-  require_cmd mkdir
-  require_cmd rm
+  require_cmd ssh
   require_cmd ln
-  require_cmd readlink
+
+  # yq is required to read catalogue YAML
+  [[ -x "$ROOT/tools/yq" ]] || die "yq is required at: $ROOT/tools/yq"
 }
 
-write_inventory_prom() {
-  local releases_dir="$1"
-  local current_link="$2"
-
-  local inventory_file="$releases_dir/version_present.prom"
-  local current_basename
-
-  current_basename="$(basename "$(readlink "$current_link")")"
-
-  {
-    echo "# HELP sppmon_release Release inventory (1 = present on disk). Label current=\"true\" marks the active release."
-    echo "# TYPE sppmon_release gauge"
-
-    for d in "$releases_dir"/*; do
-      [[ -d "$d" ]] || continue
-      [[ "$(basename "$d")" == .* ]] && continue
-
-      if [[ "$(basename "$d")" == "$current_basename" ]]; then
-        echo "sppmon_release{release=\"$(basename "$d")\",current=\"true\"} 1"
-      else
-        echo "sppmon_release{release=\"$(basename "$d")\",current=\"false\"} 1"
-      fi
-    done
-  } > "$inventory_file"
-
-  log "Wrote release inventory: $inventory_file"
+strip_leading_slash() {
+  local p="$1"
+  p="${p#/}"
+  echo "$p"
 }
+
+resolve_tenant() {
+  local apps_file="$ROOT/catalogue/apps.yml"
+  [[ -f "$apps_file" ]] || die "Missing apps catalogue: $apps_file"
+
+  local q=".apps.${APP}.tenants.${ENV_NAME}"
+  local tenant
+  tenant="$($ROOT/tools/yq -r "$q" "$apps_file" 2>/dev/null || true)"
+
+  [[ -n "${tenant//[[:space:]]/}" && "$tenant" != "null" ]] || die "Unable to resolve tenant for $APP/$ENV_NAME (expected: apps.<APP>.tenants.<ENV> in $apps_file)"
+  echo "$tenant"
+}
+
+rollback_remote_host() {
+  local target_host="$1"
+  local tenant_user="$2"
+
+  local remote_base_rel
+  remote_base_rel="$(strip_leading_slash "${SPPMON_REMOTE_BASE:-$DEFAULT_REMOTE_BASE}")"
+
+  local ssh_dest="$tenant_user@$target_host"
+
+  log "Rollback target: $target_host"
+  log "Using remote base: $remote_base_rel (relative to login dir)"
+
+  # Pass action flags to remote shell. Selection is done remotely based on what exists on disk.
+  local action_release="$RELEASE_ID"
+  local action_list="$LIST_ONLY"
+  local action_prev="$USE_PREVIOUS"
+  local action_latest="$USE_LATEST"
+
+  # IMPORTANT: when RELEASE_ID is empty (e.g., --previous/--latest), some SSH/bash combos can drop
+  # the empty positional argument and shift parameters on the remote. Use a sentinel to keep arity.
+  local action_release_arg
+  action_release_arg="$action_release"
+  if [[ -z "$action_release_arg" ]]; then
+    action_release_arg="__SPPMON_NONE__"
+  fi
+
+  # You may centralize SSH options in utils.sh; keep minimal safe defaults here.
+  local SSH_OPTS="${SPPMON_SSH_OPTS:--o StrictHostKeyChecking=no}"
+
+  ssh $SSH_OPTS "$ssh_dest" bash -s -- \
+    "$remote_base_rel" \
+    "$action_release_arg" \
+    "$action_list" \
+    "$action_prev" \
+    "$action_latest" \
+    <<'REMOTE_SH'
+set -euo pipefail
+
+log() {
+  # Bash 3/4 compatible timestamp (no printf %(...)T)
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+}
+
+die() {
+  log "ERROR: $*"
+  exit 1
+}
+
+remote_base="${1:-}"
+release_id_req="${2:-}"
+if [[ "$release_id_req" == "__SPPMON_NONE__" ]]; then
+  release_id_req=""
+fi
+list_only="${3:-false}"
+use_previous="${4:-false}"
+use_latest="${5:-false}"
+
+[[ -n "$remote_base" ]] || die "Missing remote_base argument"
+
+base_dir="$remote_base"
+releases_dir="$base_dir/releases"
+current_link="$base_dir/current"
+
+[[ -d "$releases_dir" ]] || die "No releases directory found: $releases_dir"
 
 get_current_release() {
-  local current_link="$1"
   if [[ -L "$current_link" ]]; then
     basename "$(readlink "$current_link")"
   else
@@ -148,17 +200,10 @@ get_current_release() {
 }
 
 list_releases() {
-  local releases_dir="$1"
-  local current_release="$2"
-
-  if [[ ! -d "$releases_dir" ]]; then
-    echo "(no releases directory: $releases_dir)"
-    return
-  fi
-
-  # Newest first (release IDs include sortable timestamps)
+  local current_release="$1"
   local rel
   local found="false"
+
   while IFS= read -r rel; do
     found="true"
     if [[ "$rel" == "$current_release" ]]; then
@@ -173,111 +218,98 @@ list_releases() {
   fi
 }
 
+select_latest_release() {
+  find "$releases_dir" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -exec basename {} \; | sort -r | head -n 1
+}
+
 select_previous_release() {
-  local releases_dir="$1"
-  local current_release="$2"
+  local current_release="$1"
+  [[ -n "$current_release" ]] || { echo ""; return 0; }
 
-  if [[ -z "$current_release" ]]; then
-    echo ""
-    return 0
-  fi
-
-  # Newest first list
   local rel
-  local found="false"
+  local seen_current="false"
   while IFS= read -r rel; do
-    if [[ "$found" == "true" ]]; then
-      # The first item *after* current in newest-first order is the previous (older) release.
+    if [[ "$seen_current" == "true" ]]; then
       echo "$rel"
       return 0
     fi
     if [[ "$rel" == "$current_release" ]]; then
-      found="true"
+      seen_current="true"
     fi
   done < <(find "$releases_dir" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -exec basename {} \; | sort -r)
 
-  # If we never found current or there is no older release
   echo ""
 }
 
-select_latest_release() {
-  local releases_dir="$1"
+write_inventory_prom() {
+  local current_release="$1"
+  local inventory_file="$releases_dir/version_present.prom"
 
-  # Newest first
-  find "$releases_dir" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -exec basename {} \; | sort -r | head -n 1
+  {
+    echo "# HELP sppmon_release Release inventory (1 = present on disk). Label current=\"true\" marks the active release."
+    echo "# TYPE sppmon_release gauge"
+
+    local d
+    for d in "$releases_dir"/*; do
+      [[ -d "$d" ]] || continue
+      [[ "$(basename "$d")" == .* ]] && continue
+
+      if [[ "$(basename "$d")" == "$current_release" ]]; then
+        echo "sppmon_release{release=\"$(basename "$d")\",current=\"true\"} 1"
+      else
+        echo "sppmon_release{release=\"$(basename "$d")\",current=\"false\"} 1"
+      fi
+    done
+  } > "$inventory_file"
+
+  log "Wrote release inventory: $inventory_file"
 }
 
-rollback_simulated_host() {
-  local target_name="$1"
+current_release="$(get_current_release)"
 
-  local simulated_host_root="$ROOT/hosts/$target_name"
-  local remote_base="${SPPMON_REMOTE_BASE:-$DEFAULT_REMOTE_BASE}"
+if [[ "$list_only" == "true" ]]; then
+  echo ""
+  echo "Base:   $base_dir"
+  echo "Releases:"
+  list_releases "$current_release"
+  exit 0
+fi
 
-  # Expected layout: <root>/hosts/<target>/SPP_Monitoring/{releases,current,volumes}
-  local base="$simulated_host_root$remote_base"
-  [[ "$base" == "$simulated_host_root"* ]] || die "Refusing to operate outside simulated host root: base=$base"
+selected_release="$release_id_req"
 
-  local releases_dir="$base/releases"
-  local current_link="$base/current"
+if [[ "$use_latest" == "true" ]]; then
+  selected_release="$(select_latest_release)"
+  [[ -n "$selected_release" ]] || die "--latest requested but no release is available"
+  log "Selected latest release: $selected_release (current was: ${current_release:-none})"
+fi
 
-  local current_release=""
-  if [[ -L "$current_link" ]]; then
-    current_release="$(get_current_release "$current_link")"
-  fi
+if [[ "$use_previous" == "true" ]]; then
+  selected_release="$(select_previous_release "$current_release")"
+  [[ -n "$selected_release" ]] || die "--previous requested but no older release is available (current is oldest or not found)"
+  log "Selected previous release: $selected_release (current was: ${current_release:-none})"
+fi
 
-  if [[ "$LIST_ONLY" == "true" ]]; then
-    echo ""
-    echo "Target: $target_name"
-    echo "Base:   $base"
-    echo "Releases:"
-    list_releases "$releases_dir" "$current_release"
-    return 0
-  fi
+[[ -n "$selected_release" ]] || die "No release selected (use --release, --previous, or --latest)"
+[[ -d "$releases_dir/$selected_release" ]] || die "Release not found: $releases_dir/$selected_release"
 
-  local selected_release="$RELEASE_ID"
-  if [[ "$USE_PREVIOUS" == "true" ]]; then
-    selected_release="$(select_previous_release "$releases_dir" "$current_release")"
-    [[ -n "$selected_release" ]] || die "--previous requested but no older release is available (current is oldest or not found)"
-    log "Selected previous release: $selected_release (current was: ${current_release:-none})"
-  fi
-  if [[ "$USE_LATEST" == "true" ]]; then
-    selected_release="$(select_latest_release "$releases_dir")"
-    [[ -n "$selected_release" ]] || die "--latest requested but no release is available (need at least 1 release)"
-    log "Selected latest release: $selected_release (current was: ${current_release:-none})"
-  fi
+# IMPORTANT: keep current symlink relative to base_dir.
+ln -sfn "releases/$selected_release" "$current_link"
+log "OK: current -> $(readlink "$current_link")"
 
-  local target_release_dir="$releases_dir/$selected_release"
-
-  log "Rollback (simulation) on target: $target_name"
-  log "Using base: $base"
-
-  [[ -d "$releases_dir" ]] || die "No releases directory found: $releases_dir"
-  [[ -d "$target_release_dir" ]] || die "Release not found: $target_release_dir"
-
-  # Switch current symlink atomically
-  ln -sfn "$target_release_dir" "$current_link"
-  log "OK: current -> $(readlink "$current_link")"
-
-  # Refresh inventory file
-  write_inventory_prom "$releases_dir" "$current_link"
-}
-
-rollback_remote_placeholder() {
-  warn "Remote rollback requested but SSH logic is not enabled yet (placeholder)."
-  warn "Use simulation mode (no --remote) for now."
+write_inventory_prom "$selected_release"
+REMOTE_SH
 }
 
 main() {
   parse_args "$@"
   validate_args
 
+  local tenant
+  tenant="$(resolve_tenant)"
+
   local host
   for host in $(normalize_list "$TARGETS_RAW"); do
-    if [[ "$ENABLE_REMOTE" == "true" ]]; then
-      rollback_remote_placeholder
-    else
-      rollback_simulated_host "$host"
-    fi
+    rollback_remote_host "$host" "$tenant"
   done
 
   if [[ "$LIST_ONLY" != "true" ]]; then

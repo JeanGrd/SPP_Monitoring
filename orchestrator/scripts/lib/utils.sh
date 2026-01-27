@@ -7,8 +7,6 @@ set -euo pipefail
 # Logs go to STDERR so functions can safely return data via STDOUT.
 # ------------------------------------------------------------------------------
 
-# ---- Time helpers ------------------------------------------------------------
-
 # Compact timestamp for IDs (e.g. 20260113_143017)
 release_timestamp() {
   date +'%Y%m%d_%H%M%S'
@@ -32,10 +30,6 @@ die() {
 
 # ---- Validation helpers ------------------------------------------------------
 
-require_cmd() {
-  command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
-}
-
 # Converts "a,b,c" to "a b c" and trims whitespace.
 normalize_list() {
   local s="${1:-}"
@@ -44,7 +38,41 @@ normalize_list() {
   echo "$s"
 }
 
-# Valid app/env names: letters, digits, underscore, dash.
-is_valid_name() {
-  [[ "${1:-}" =~ ^[A-Za-z0-9_-]+$ ]]
+# ---- Marley functions ------------------------------------------------------
+
+marley_query() {
+  # Usage:
+  #   marley_query "<app>" "<env>" "<targets>" "<os>"
+  #
+  # Any argument can be empty ("") to disable the filter.
+
+  local app="${1:-}"
+  local env="${2:-}"
+  local targets="${3:-}"
+  local os="${4:-}"
+
+  local -a args
+  args=(-F "," -H)
+
+  [[ -n "$app"     ]] && args+=(--main_app "$app")
+  [[ -n "$env"     ]] && args+=(--environment "$env")
+  [[ -n "$targets" ]] && args+=(--FQDN "$targets")
+  [[ -n "$os"      ]] && args+=(--os_name "$os")
+
+  ./fake_marley "${args[@]}" "main_app,environment,fqdn,os_name"
+}
+
+# Helper to get CLI arg value or empty string
+get_arg_value() {
+  local key="$1"
+  local val=""
+  local found=0
+  for ((i=0; i < ${#shift_args[@]}; i++)); do
+    if [[ "${shift_args[i]}" == "$key" && $((i+1)) -lt ${#shift_args[@]} ]]; then
+      val="${shift_args[i+1]}"
+      found=1
+      break
+    fi
+  done
+  echo "$val"
 }

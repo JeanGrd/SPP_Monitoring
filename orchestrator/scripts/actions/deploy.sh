@@ -1,841 +1,483 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ------------------------------------------------------------------------------
-# deploy.sh
-# Responsibilities:
-# - Build a release tarball (binaries + fragments + metadata)
-# - Deploy it to one or more targets over SSH/SCP
-# ------------------------------------------------------------------------------
+# Simplified, strict-by-default remote deploy.
+# - Builds a release tarball locally.
+# - Uploads and installs it on remote targets.
+# - Switches <base>/current -> releases/<release_id>
 
 # shellcheck disable=SC2164
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIB_DIR="$(cd "$SCRIPT_DIR/../lib" && pwd)"
-
 source "$LIB_DIR/utils.sh"
 
-# ---- Defaults ----------------------------------------------------------------
+ROOT=""          # repo root (passed by sppmon)
+APP=""           # ICOM, Jaguar, ...
+ENV_NAME=""      # UAT, PRD, ...
+TENANT=""        # ssh user
+TARGETS_RAW=""   # comma list
+SERVICES_RAW=""  # comma list (optional), supports svc@ver
 
-# Default deploy base directory (relative to the remote login directory).
-# Can be overridden with SPPMON_REMOTE_BASE.
-DEFAULT_REMOTE_BASE="SPP_Monitoring"
-SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+REMOTE_BASE_DEFAULT="SPP_Monitoring"   # relative to remote login dir
+SSH_OPTS="-o StrictHostKeyChecking=no"
 
-# ---- Parsed arguments --------------------------------------------------------
+CATALOGUE=""
+YQ=""
 
-ROOT=""
-APP=""
-ENV_NAME=""
-TARGETS_RAW=""
-SERVICES_RAW=""
-RESOLVED_SERVICES_RAW=""
-CATALOGUE_DIR=""
-YQ_BIN=""
-TENANT=""
-SERVICES_STRIPPED_RAW=""
-SERVICE_VERSION_OVERRIDES=""  # space-separated svc=version
-
-print_help() {
+help() {
   cat <<'EOF'
-deploy.sh - Build and deploy a release
+Deploy a release (remote).
 
 USAGE:
-  deploy.sh --root <path> --app <APP> --env <ENV> --targets <list> [--services <list>]
+  deploy.sh --root <path> --app <APP> --env <ENV> --tenant <SSH_USER> --targets <t1,t2> [--services <svc1,svc2|svc@ver>]
 
 REQUIRED:
-  --root <path>        Repository root (passed by sppmon)
-  --app <name>         Application name (ICOM, Jaguar, ...)
-  --env <name>         Environment (UAT, PRD, ...)
-  --targets <list>     Comma-separated targets (e.g. "188.23.34.10,188.23.34.11")
+  --app, --env, --tenant, --targets
 
 OPTIONAL:
-  --services <list>    Comma-separated services to include (supports svc@version, e.g. "alloy@1.3,loki_exporter")
-  --help               Show this help
+  --services   If omitted, defaults come from catalogue/apps.yml -> apps.<APP>.defaults.services
 
 NOTES:
-  - Fragments are packaged under: etc/ (flattened copy of <root>/catalogue/templates/<fragment>/ contents).
-  - Fragments are selected from:   catalogue/services.yml -> services.<service>.fragments
-  - Binaries are sourced from: <root>/bin/<binary>/<version>/<binary> (version comes from svc@version or services.yml: services.<service>.binary.default_version).
-  - Each release includes: bin/control.sh, bin/readme.txt (usage guide), and bin/environment.sh (machine-readable service runtime info).
+  - Binaries are sourced from: <root>/bin/<binary>/<version>/<binary>
+  - Fragments are copied from: <root>/catalogue/templates/<fragment>/ (contents flattened into etc/)
+  - Endpoints are read from:   <root>/catalogue/envs.yml -> envs.<ENV>.endpoint.{mimir,loki,minio}
 EOF
 }
-parse_services_and_versions() {
-  # Input: SERVICES_RAW (comma-separated, possibly with svc@version)
-  # Output: sets SERVICES_STRIPPED_RAW (comma-separated), SERVICE_VERSION_OVERRIDES (space-separated svc=version)
-  SERVICES_STRIPPED_RAW=""
-  SERVICE_VERSION_OVERRIDES=""
-  local input="$SERVICES_RAW"
-  local IFS=',' entry svc ver
-  for entry in $input; do
-    entry="$(echo "$entry" | xargs 2>/dev/null)"  # trim spaces
-    if [[ "$entry" == *"@"* ]]; then
-      svc="${entry%%@*}"
-      ver="${entry#*@}"
-      if [[ -z "$svc" ]]; then
-        die "Invalid service entry (empty service name): '$entry'"
-      fi
-      if [[ -n "$SERVICES_STRIPPED_RAW" ]]; then
-        SERVICES_STRIPPED_RAW="$SERVICES_STRIPPED_RAW,$svc"
-      else
-        SERVICES_STRIPPED_RAW="$svc"
-      fi
-      if [[ -n "$ver" ]]; then
-        if [[ -n "$SERVICE_VERSION_OVERRIDES" ]]; then
-          SERVICE_VERSION_OVERRIDES="$SERVICE_VERSION_OVERRIDES $svc=$ver"
-        else
-          SERVICE_VERSION_OVERRIDES="$svc=$ver"
-        fi
-      fi
-    else
-      svc="$entry"
-      if [[ -z "$svc" ]]; then
-        die "Invalid service entry (empty service name): '$entry'"
-      fi
-      if [[ -n "$SERVICES_STRIPPED_RAW" ]]; then
-        SERVICES_STRIPPED_RAW="$SERVICES_STRIPPED_RAW,$svc"
-      else
-        SERVICES_STRIPPED_RAW="$svc"
-      fi
-    fi
-  done
-}
 
-get_service_version_override() {
-  # Usage: get_service_version_override <svc>
-  # Output: echo version if present in SERVICE_VERSION_OVERRIDES, else echo empty
-  local svc="$1"
-  local pair
-  for pair in $SERVICE_VERSION_OVERRIDES; do
-    if [[ "$pair" == "$svc="* ]]; then
-      echo "${pair#*=}"
-      return 0
-    fi
-  done
-  echo ""
-}
-
-# ---- Argument parsing --------------------------------------------------------
-
-parse_args() {
+parse() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --root)     ROOT="${2:-}"; shift 2 ;;
-      --app)      APP="${2:-}"; shift 2 ;;
-      --env)      ENV_NAME="${2:-}"; shift 2 ;;
-      --targets)  TARGETS_RAW="${2:-}"; shift 2 ;;
+      --root) ROOT="${2:-}"; shift 2 ;;
+      --app) APP="${2:-}"; shift 2 ;;
+      --env) ENV_NAME="${2:-}"; shift 2 ;;
+      --tenant) TENANT="${2:-}"; shift 2 ;;
+      --targets) TARGETS_RAW="${2:-}"; shift 2 ;;
       --services) SERVICES_RAW="${2:-}"; shift 2 ;;
-      --help|-h)  print_help; exit 0 ;;
+      --help|-h) help; exit 0 ;;
       *) die "Unknown argument: $1 (use --help)" ;;
     esac
   done
 }
 
-validate_args() {
-  [[ -n "$ROOT" ]]        || die "--root is required"
-  [[ -n "$APP" ]]         || die "--app is required"
-  [[ -n "$ENV_NAME" ]]    || die "--env is required"
-  [[ -n "$TARGETS_RAW" ]] || die "--targets is required"
-
-  is_valid_name "$APP"      || die "Invalid app name: $APP"
-  is_valid_name "$ENV_NAME" || die "Invalid env name: $ENV_NAME"
-
-  require_cmd tar
-  require_cmd find
-  require_cmd mkdir
-  require_cmd rm
-  require_cmd mv
-  require_cmd readlink
-  require_cmd ssh
-  require_cmd scp
-  CATALOGUE_DIR="$ROOT/catalogue"
-  [[ -d "$CATALOGUE_DIR" ]] || die "catalogue directory not found: $CATALOGUE_DIR"
+need() {
+  local v="$1"; local name="$2"
+  [[ -n "${v//[[:space:]]/}" ]] || die "$name is required"
 }
 
+init() {
+  need "$ROOT" "--root"
+  need "$APP" "--app"
+  need "$ENV_NAME" "--env"
+  need "$TENANT" "--tenant"
+  need "$TARGETS_RAW" "--targets"
 
-detect_yq() {
-  # Prefer a vendored yq binary if present under <root>/tools.
-  local candidate=""
+  CATALOGUE="$ROOT/catalogue"
+  [[ -d "$CATALOGUE" ]] || die "catalogue not found: $CATALOGUE"
 
-  # Fallback: accept other naming conventions (e.g. yq_darwin_amd64) under tools/.
-  if [[ -d "$ROOT/tools" ]]; then
-    candidate="$(find "$ROOT/tools" -maxdepth 1 -type f -name 'yq*' 2>/dev/null | head -n 1 || true)"
-    if [[ -n "$candidate" ]]; then
-      if [[ ! -x "$candidate" ]]; then
-        chmod +x "$candidate" 2>/dev/null || true
-      fi
-      if [[ -x "$candidate" ]]; then
-        YQ_BIN="$candidate"
-        return 0
-      fi
-    fi
-  fi
-
-  # Last resort: system yq.
-  if command -v yq >/dev/null 2>&1; then
-    YQ_BIN="yq"
-    return 0
-  fi
-
-  die "yq is required to read catalogue YAML. Install yq or vendor it at <root>/tools/yq (ensure it is executable)"
+  YQ="$ROOT/tools/yq"
+  [[ -x "$YQ" ]] || die "yq not found/executable at: $YQ"
 }
 
-resolve_app_key_in_apps_yml() {
-  # Returns the canonical app key as found in catalogue/apps.yml (tries case variants).
-  local app="$APP"
-  local apps_file="$CATALOGUE_DIR/apps.yml"
-  [[ -f "$apps_file" ]] || die "apps.yml not found: $apps_file"
+# -------- catalogue helpers --------
 
-  local q t
-  for q in "$app" "$(echo "$app" | tr '[:lower:]' '[:upper:]')" "$(echo "$app" | tr '[:upper:]' '[:lower:]')"; do
-    t="$($YQ_BIN -r ".apps.\"$q\" | type" "$apps_file" 2>/dev/null || true)"
-    if [[ -n "$t" && "$t" != "null" ]]; then
-      echo "$q"
-      return 0
+yq_svc_exists() {
+  local svc="$1"
+  local t
+  t="$($YQ -r ".services.\"$svc\" | type" "$CATALOGUE/services.yml")"
+  [[ "$t" != "null" ]]
+}
+
+# Map a fragment name -> service name if it matches exactly one service.fragments entry.
+fragment_to_service() {
+  local frag="$1"
+  local matches count
+  matches="$($YQ -r '.services | to_entries | map(select((.value.fragments // []) | index('"\"$frag\""'))) | .[].key' "$CATALOGUE/services.yml" || true)"
+  count="$(echo "$matches" | sed '/^\s*$/d' | wc -l | tr -d '[:space:]')"
+  [[ "$count" == "1" ]] && echo "$(echo "$matches" | sed '/^\s*$/d' | head -n1)" || echo ""
+}
+
+svc_requires_csv() {
+  local svc="$1"
+  $YQ -r ".services.\"$svc\".requires // [] | join(\",\")" "$CATALOGUE/services.yml"
+}
+
+svc_fragments_csv() {
+  local svc="$1"
+  $YQ -r ".services.\"$svc\".fragments // [] | join(\",\")" "$CATALOGUE/services.yml"
+}
+
+svc_desc() {
+  local svc="$1"
+  $YQ -r ".services.\"$svc\".description // \"\"" "$CATALOGUE/services.yml"
+}
+
+svc_args() {
+  local svc="$1"
+  $YQ -r ".services.\"$svc\".args // \"\"" "$CATALOGUE/services.yml"
+}
+
+svc_bin_name() {
+  local svc="$1"
+  $YQ -r ".services.\"$svc\".binary.name // \"\"" "$CATALOGUE/services.yml"
+}
+
+svc_bin_default_version() {
+  local svc="$1"
+  $YQ -r ".services.\"$svc\".binary.default_version // \"\"" "$CATALOGUE/services.yml"
+}
+
+svc_bin_versions_csv() {
+  local svc="$1"
+  $YQ -r ".services.\"$svc\".binary.available_versions // [] | join(\",\")" "$CATALOGUE/services.yml"
+}
+
+app_defaults_csv() {
+  $YQ -r ".apps.\"$APP\".defaults.services // [] | join(\",\")" "$CATALOGUE/apps.yml"
+}
+
+env_endpoint() {
+  local key="$1" # mimir|loki|minio
+  if [[ -f "$CATALOGUE/envs.yml" ]]; then
+    $YQ -r ".envs.\"$ENV_NAME\".endpoint.$key // \"\"" "$CATALOGUE/envs.yml"
+  else
+    echo ""
+  fi
+}
+
+# -------- services parsing/expansion --------
+
+trim() {
+  local s="$1"
+  s="${s#${s%%[![:space:]]*}}"
+  s="${s%${s##*[![:space:]]}}"
+  printf '%s' "$s"
+}
+
+# Parse SERVICES_RAW into two globals:
+# - SERVICES_LIST="svc1 svc2"
+# - OVERRIDES="svc=ver svc=ver"
+SERVICES_LIST=""
+OVERRIDES=""
+
+parse_services() {
+  local input="$1"
+  SERVICES_LIST=""; OVERRIDES=""
+
+  local IFS=',' entry svc ver
+  for entry in $input; do
+    entry="$(trim "$entry")"
+    [[ -n "$entry" ]] || continue
+
+    if [[ "$entry" == *"@"* ]]; then
+      svc="${entry%%@*}"; ver="${entry#*@}"
+      [[ -n "$svc" ]] || die "Invalid service token: '$entry'"
+      SERVICES_LIST+="${SERVICES_LIST:+ }$svc"
+      [[ -n "$ver" ]] && OVERRIDES+="${OVERRIDES:+ }$svc=$ver"
+    else
+      SERVICES_LIST+="${SERVICES_LIST:+ }$entry"
     fi
   done
 
-  die "App '$APP' not found in $apps_file (expected: apps.<APP>)"
+  [[ -n "$SERVICES_LIST" ]] || die "No services selected"
 }
 
-yq_read_apps_scalar() {
-  # Reads a scalar value under .apps.<APP_KEY>.<path>. Returns empty string on null/missing.
-  local app_key="$1"
-  local path="$2"
-  local apps_file="$CATALOGUE_DIR/apps.yml"
-
-  local value
-  value="$($YQ_BIN -r ".apps.\"$app_key\".$path // \"\"" "$apps_file" 2>/dev/null || true)"
-  [[ "$value" == "null" ]] && value=""
-  echo "$value"
-}
-
-load_default_services_for_app() {
-  # Reads apps.<APP>.defaults.services from catalogue/apps.yml.
-  local apps_file="$CATALOGUE_DIR/apps.yml"
-  [[ -f "$apps_file" ]] || die "apps.yml not found: $apps_file"
-
-  local app_key
-  app_key="$(resolve_app_key_in_apps_yml)"
-
-  local value
-  value="$($YQ_BIN -r ".apps.\"$app_key\".defaults.services // [] | join(\",\")" "$apps_file" 2>/dev/null || true)"
-  [[ "$value" == "null" ]] && value=""
-
-  if [[ -n "${value//[[:space:]]/}" ]]; then
-    SERVICES_RAW="$value"
-    return 0
-  fi
-
-  die "No default services found for app '$APP' in $apps_file (expected: apps.<APP>.defaults.services)"
-}
-
-load_tenant_for_app() {
-  # Reads apps.<APP>.tenants.<ENV_NAME> from catalogue/apps.yml.
-  local apps_file="$CATALOGUE_DIR/apps.yml"
-  [[ -f "$apps_file" ]] || die "apps.yml not found: $apps_file"
-
-  local app_key
-  app_key="$(resolve_app_key_in_apps_yml)"
-
-  local value
-  value="$(yq_read_apps_scalar "$app_key" "tenants.\"$ENV_NAME\"")"
-
-  if [[ -n "${value//[[:space:]]/}" ]]; then
-    TENANT="$value"
-    return 0
-  fi
-
-  die "No tenant found for app '$APP' env '$ENV_NAME' in $apps_file (expected: apps.<APP>.tenants.<ENV>)"
-}
-
-
-load_service_requires() {
-  # Reads services.<service>.requires from catalogue/services.yml.
-  # Returns a comma-separated list (may be empty if no requirements).
-  local svc="$1"
-  local services_file="$CATALOGUE_DIR/services.yml"
-  [[ -f "$services_file" ]] || die "services.yml not found: $services_file"
-
-  local value
-  value="$("$YQ_BIN" -r ".services.\"$svc\".requires // [] | join(\",\")" "$services_file" 2>/dev/null || true)"
-  if [[ -z "$value" || "$value" == "null" ]]; then
-    echo ""
-    return 0
-  fi
-  echo "$value"
-}
-
-
-# --- Helper: read binary for a service as name|version (single line) ---
-yq_read_service_binary() {
-  # Usage: yq_read_service_binary <svc>
-  # Output: name|version (version resolved: override -> default_version)
-  local svc="$1"
-  local services_file="$CATALOGUE_DIR/services.yml"
-  [[ -f "$services_file" ]] || die "services.yml not found: $services_file"
-  local yq="$YQ_BIN"
-
-  local name default_version available_versions override_version version
-
-  name="$($yq -r ".services.\"$svc\".binary.name // \"\"" "$services_file" 2>/dev/null || true)"
-  [[ "$name" == "null" ]] && name=""
-  # If no binary declared, return empty (config-only service)
-  if [[ -z "${name//[[:space:]]/}" ]]; then
-    echo ""
-    return 0
-  fi
-
-  default_version="$($yq -r ".services.\"$svc\".binary.default_version // \"\"" "$services_file" 2>/dev/null || true)"
-  [[ "$default_version" == "null" ]] && default_version=""
-
-  override_version="$(get_service_version_override "$svc")"
-  version="$override_version"
-  if [[ -z "${version//[[:space:]]/}" ]]; then
-    version="$default_version"
-  fi
-
-  [[ -n "${version//[[:space:]]/}" ]] || die "Missing version for binary '$name' in service '$svc' (expected .binary.default_version in $services_file or svc@version override)"
-
-  available_versions="$($yq -r ".services.\"$svc\".binary.available_versions // [] | join(\",\")" "$services_file" 2>/dev/null || true)"
-  [[ "$available_versions" == "null" ]] && available_versions=""
-  if [[ -n "${available_versions//[[:space:]]/}" ]]; then
-    local ok="no" av
-    IFS=',' read -r -a _avs <<< "$available_versions"
-    for av in "${_avs[@]}"; do
-      [[ "$av" == "$version" ]] && ok="yes"
-    done
-    [[ "$ok" == "yes" ]] || die "Version '$version' for binary '$name' in service '$svc' not found in available_versions ($available_versions)"
-  fi
-
-  echo "${name}|${version}"
-}
-
-
-# --- Service name resolver for requires ---
-resolve_service_name() {
-  # Maps an input name to a service name.
-  # - If name matches a service key: return it
-  # - Else, if name matches exactly one service whose fragments contain it: return that service
-  # - Else: return empty
-  local name="$1"
-  local services_file="$CATALOGUE_DIR/services.yml"
-
-  local t
-  t="$($YQ_BIN -r ".services.\"$name\" | type" "$services_file" 2>/dev/null || true)"
-  if [[ -n "$t" && "$t" != "null" ]]; then
-    echo "$name"
-    return 0
-  fi
-
-  # Fallback: find a service that declares this fragment.
-  local matches
-  matches="$($YQ_BIN -r ".services | to_entries | map(select((.value.fragments // []) | index(\"$name\"))) | .[].key" "$services_file" 2>/dev/null || true)"
-  # yq prints one per line; count
-  local count
-  count="$(echo "$matches" | sed '/^\s*$/d' | wc -l | tr -d '[:space:]')"
-  if [[ "$count" == "1" ]]; then
-    echo "$(echo "$matches" | sed '/^\s*$/d' | head -n 1)"
-    return 0
-  fi
-
+override_for() {
+  local svc="$1" pair
+  for pair in $OVERRIDES; do
+    [[ "$pair" == "$svc="* ]] && { echo "${pair#*=}"; return 0; }
+  done
   echo ""
 }
 
-resolve_services_with_requires() {
-  # Expands SERVICES_RAW into RESOLVED_SERVICES_RAW by adding transitive requires.
-  # Order: requirements first, then the requested service.
-  local requested="$1"
-  local resolved=""
-  local seen=""
+# Expand requires transitively. Accept requires entries as:
+# - service names
+# - OR fragment names (mapped to a unique service)
+expand_services() {
+  local seen="" out=""
 
-  _dfs_add() {
-    local svc="$1"
-    local mapped
-    mapped="$(resolve_service_name "$svc")"
-    if [[ -z "$mapped" ]]; then
-      die "Unknown service or requirement '$svc' (not found as service or unique fragment in $CATALOGUE_DIR/services.yml)"
+  _add() {
+    local name="$1" svc reqs r mapped
+
+    if yq_svc_exists "$name"; then
+      svc="$name"
+    else
+      mapped="$(fragment_to_service "$name")"
+      [[ -n "$mapped" ]] || die "Unknown service/requirement '$name' (not a service key and not a unique fragment)"
+      svc="$mapped"
     fi
-    svc="$mapped"
 
-    # guard: avoid infinite loops / duplicates
-    case " $seen " in
-      *" $svc "*) return 0 ;;
-    esac
+    case " $seen " in *" $svc "*) return 0 ;; esac
     seen="$seen $svc"
 
-    local reqs
-    reqs="$(load_service_requires "$svc")"
-    if [[ -n "$reqs" ]]; then
-      local r
-      for r in $(normalize_list "$reqs"); do
-        _dfs_add "$r"
+    reqs="$(svc_requires_csv "$svc")"
+    if [[ -n "${reqs//[[:space:]]/}" ]]; then
+      for r in $(echo "$reqs" | tr ',' ' '); do
+        [[ -n "$r" ]] || continue
+        _add "$r"
       done
     fi
 
-    # append to resolved if not already present (preserve order)
-    case " $resolved " in
-      *" $svc "*) : ;;
-      *) resolved="$resolved $svc" ;;
-    esac
+    out+="${out:+ }$svc"
   }
 
-  local svc
-  for svc in $(normalize_list "$requested"); do
-    _dfs_add "$svc"
+  local s
+  for s in $SERVICES_LIST; do
+    _add "$s"
   done
 
-  # normalize to comma-separated list
-  echo "$resolved" | tr ' ' '\n' | sed '/^\s*$/d' | paste -sd ',' -
+  echo "$out"
 }
 
-# ---- Build release (stdout = data only) --------------------------------------
+# -------- build release --------
+
+copy_fragment_dir_flat() {
+  local frag="${1:-}" src dst
+  dst="$2"
+  [[ -n "${frag//[[:space:]]/}" ]] || die "Empty fragment name"
+  src="$CATALOGUE/templates/$frag"
+  [[ -d "$src" ]] || die "Missing fragment template: $src"
+
+  shopt -s nullglob dotglob
+  local p
+  for p in "$src"/*; do
+    cp -R "$p" "$dst/"
+  done
+  shopt -u nullglob dotglob
+}
+
+copy_binary_for_service() {
+  local svc="$1" libdst="$2"
+  local bin ver versions override src
+
+  bin="$(svc_bin_name "$svc")"
+  [[ -n "${bin//[[:space:]]/}" ]] || return 0  # config-only
+
+  override="$(override_for "$svc")"
+  ver="$override"
+  [[ -n "${ver//[[:space:]]/}" ]] || ver="$(svc_bin_default_version "$svc")"
+  [[ -n "${ver//[[:space:]]/}" ]] || die "No version for binary '$bin' in service '$svc'"
+
+  versions="$(svc_bin_versions_csv "$svc")"
+  if [[ -n "${versions//[[:space:]]/}" ]]; then
+    local ok=no v
+    for v in $(echo "$versions" | tr ',' ' '); do
+      [[ "$v" == "$ver" ]] && ok=yes
+    done
+    [[ "$ok" == yes ]] || die "Version '$ver' not allowed for '$svc' (allowed: $versions)"
+  fi
+
+  src="$ROOT/bin/$bin/$ver/$bin"
+  [[ -f "$src" ]] || die "Missing binary for '$svc': $src"
+  cp "$src" "$libdst/$bin"
+  chmod +x "$libdst/$bin" || true
+}
 
 build_release() {
-  local ts_id ts_human release_id
-  local dist_dir work_dir pkg_dir tarball
+  local ts_id ts_human rid work pkg dist tar
 
   ts_id="$(release_timestamp)"
   ts_human="$(human_timestamp)"
-  release_id="${APP}_${ENV_NAME}_${ts_id}"
+  rid="${APP}_${ENV_NAME}_${ts_id}"
 
-  dist_dir="$ROOT/dist"
-  work_dir="$(mktemp -d)"
-  pkg_dir="$work_dir/$release_id"
+  dist="$ROOT/dist"; mkdir -p "$dist"
+  work="$(mktemp -d)"
+  pkg="$work/$rid"
 
-  mkdir -p "$dist_dir" "$pkg_dir/bin" "$pkg_dir/lib" "$pkg_dir/etc" "$pkg_dir/meta"
+  mkdir -p "$pkg/bin" "$pkg/lib" "$pkg/etc" "$pkg/meta"
 
-  log "Building release: $release_id"
-
-  # Human-readable structure guide (shipped with every release)
-  cat > "$pkg_dir/meta/structure.txt" <<EOF
-SPP Monitoring deployment layout (target host)
-
-<BASE>/
-  releases/
-    <RELEASE_ID>/
-      bin/            Control scripts (control.sh, environment.sh)
-      lib/            Runtime binaries shipped with the release
-      etc/            Configuration fragments (flattened)
-      meta/           Metadata (this manifest, structure guide)
-    current -> releases/<RELEASE_ID>
-  volumes/
-    data/             Persistent data (WAL, buffers, etc.)
-    logs/             Service logs (stdout/stderr)
-    run/              PID files and runtime state
-
-Notes:
-- Releases are immutable. Rollback switches the 'current' symlink.
-- Services are started from <BASE>/current using bin/control.sh.
-EOF
-
-  # --- Copy fragments per service (aggregate unique fragments) ---
-  local services_file
-  services_file="$CATALOGUE_DIR/services.yml"
-  [[ -f "$services_file" ]] || die "services.yml not found: $services_file"
-  local svc fragments_csv fragment fragments_space
-  local fragments_ordered="" fragments_seen=""
-  # Aggregate unique fragments (ordered)
-  for svc in $(normalize_list "$RESOLVED_SERVICES_RAW"); do
-    # Skip unknown entries (can happen if a requirement references a fragment name).
-    if [[ "$($YQ_BIN -r ".services.\"$svc\" | type" "$services_file" 2>/dev/null || true)" == "null" ]]; then
-      continue
-    fi
-    fragments_csv="$($YQ_BIN -r ".services.\"$svc\".fragments // [] | join(\",\")" "$services_file" 2>/dev/null || true)"
-    [[ "$fragments_csv" == "null" ]] && fragments_csv=""
-    fragments_space="$(echo "$fragments_csv" | tr ',' ' ' | xargs 2>/dev/null || true)"
-    for fragment in $fragments_space; do
-      case " $fragments_seen " in
-        *" $fragment "*) : ;;
-        *)
-          fragments_ordered="$fragments_ordered $fragment"
-          fragments_seen="$fragments_seen $fragment"
-          ;;
-      esac
+  # fragments: union of selected services.fragments (unique, ordered)
+  local frags_seen="" frags="" svc fcsv f
+  for svc in $EXPANDED_SERVICES; do
+    fcsv="$(svc_fragments_csv "$svc")"
+    for f in $(echo "$fcsv" | tr ',' ' '); do
+      [[ -n "$f" ]] || continue
+      case " $frags_seen " in *" $f "*) : ;; *) frags_seen="$frags_seen $f"; frags+="${frags:+ }$f" ;; esac
     done
   done
-  # Helper: copy an entry into etc/, handling collisions and strict mode
-  _copy_into_etc() {
-    local src_path="$1"
-    local base dest
 
-    base="$(basename "$src_path")"
-    dest="$pkg_dir/etc/$base"
-
-    if [[ -e "$dest" ]]; then
-      die "Template collision: '$base' already exists in etc/"
-    fi
-
-    cp -R "$src_path" "$pkg_dir/etc/"
-  }
-
-  # Now copy each fragment's contents into etc/
-  for fragment in $fragments_ordered; do
-    local template_src entry inner
-    template_src="$CATALOGUE_DIR/templates/$fragment"
-    if [[ -d "$template_src" ]]; then
-      shopt -s nullglob dotglob
-      for entry in "$template_src"/*; do
-        if [[ -d "$entry" ]]; then
-          for inner in "$entry"/*; do
-            _copy_into_etc "$inner"
-          done
-        else
-          _copy_into_etc "$entry"
-        fi
-      done
-      shopt -u nullglob dotglob
-    else
-      die "Missing fragment template directory for fragment '$fragment' (expected: $CATALOGUE_DIR/templates/$fragment)"
-    fi
+  for f in $frags; do
+    copy_fragment_dir_flat "$f" "$pkg/etc"
   done
 
-  # Copy binaries as declared in catalogue/services.yml (version-aware):
-  #   services.<service>.binary: {name, default_version, ...}
-  for svc in $(normalize_list "$RESOLVED_SERVICES_RAW"); do
-    # Skip unknown entries (can happen if a requirement references a fragment name).
-    if [[ "$($YQ_BIN -r ".services.\"$svc\" | type" "$services_file" 2>/dev/null || true)" == "null" ]]; then
-      continue
-    fi
-    line="$(yq_read_service_binary "$svc")"
-    if [[ -z "$line" ]]; then
-      continue
-    fi
-    bin_name="${line%%|*}"
-    bin_version="${line#*|}"
-    [[ -z "$bin_name" || -z "$bin_version" ]] && continue
-    src="$ROOT/bin/$bin_name/$bin_version/$bin_name"
-    if [[ -f "$src" ]]; then
-      cp "$src" "$pkg_dir/lib/$bin_name"
-      chmod +x "$pkg_dir/lib/$bin_name" || true
-    else
-      die "Missing binary '$bin_name' version '$bin_version' for service '$svc' (expected: $src)"
-    fi
+  # binaries
+  for svc in $EXPANDED_SERVICES; do
+    copy_binary_for_service "$svc" "$pkg/lib"
   done
 
-  # Include runtime control plane (shipped with every release)
-  # Target (release): bin/control.sh and bin/readme.txt (or CONTROL.txt)
-  if [[ -f "$ROOT/scripts/runtime/control.sh" ]]; then
-    cp "$ROOT/scripts/runtime/control.sh" "$pkg_dir/bin/control.sh"
-    chmod +x "$pkg_dir/bin/control.sh" || true
-    # Also ship the shared runtime environment script
-    if [[ -f "$ROOT/scripts/runtime/environment.sh" ]]; then
-      cp "$ROOT/scripts/runtime/environment.sh" "$pkg_dir/bin/environment.sh"
-    else
-      die "Missing shared runtime environment script (expected: $ROOT/scripts/runtime/environment.sh)"
-    fi
-  else
-    die "Missing runtime control script (expected: $ROOT/scripts/runtime/control.sh)"
-  fi
+  # runtime scripts (shipped per release)
+  [[ -f "$ROOT/scripts/runtime/control.sh" ]] || die "Missing: $ROOT/scripts/runtime/control.sh"
+  [[ -f "$ROOT/scripts/runtime/environment.sh" ]] || die "Missing: $ROOT/scripts/runtime/environment.sh"
+  cp "$ROOT/scripts/runtime/control.sh" "$pkg/bin/control.sh"
+  chmod +x "$pkg/bin/control.sh" || true
+  cp "$ROOT/scripts/runtime/environment.sh" "$pkg/bin/environment.sh"
 
-  if [[ -f "$ROOT/scripts/runtime/readme.txt" ]]; then
-    cp "$ROOT/scripts/runtime/readme.txt" "$pkg_dir/bin/readme.txt"
-  elif [[ -f "$ROOT/scripts/runtime/CONTROL.txt" ]]; then
-    cp "$ROOT/scripts/runtime/CONTROL.txt" "$pkg_dir/bin/CONTROL.txt"
-  else
-    die "Missing control documentation (expected: $ROOT/scripts/runtime/readme.txt or CONTROL.txt)"
-  fi
+  # release-specific exports appended to bin/environment.sh
+  local em el eni
+  em="$(env_endpoint mimir)"
+  el="$(env_endpoint loki)"
+  eni="$(env_endpoint minio)"
 
+  # runtime services = services that have a binary
+  local runtime="" b
+  for svc in $EXPANDED_SERVICES; do
+    b="$(svc_bin_name "$svc")"
+    [[ -n "${b//[[:space:]]/}" ]] || continue
+    runtime+="${runtime:+ }$svc"
+  done
 
-  # --- Enrich endpoints (for manifest and environment.sh) ---
-  local envs_file endpoint_mimir endpoint_loki endpoint_minio
-  envs_file="$CATALOGUE_DIR/envs.yml"
-  endpoint_mimir=""; endpoint_loki=""; endpoint_minio=""
-  if [[ -f "$envs_file" ]]; then
-    endpoint_mimir="$($YQ_BIN -r ".envs.\"$ENV_NAME\".endpoint.mimir // \"\"" "$envs_file" 2>/dev/null || true)"
-    endpoint_loki="$($YQ_BIN -r ".envs.\"$ENV_NAME\".endpoint.loki // \"\"" "$envs_file" 2>/dev/null || true)"
-    endpoint_minio="$($YQ_BIN -r ".envs.\"$ENV_NAME\".endpoint.minio // \"\"" "$envs_file" 2>/dev/null || true)"
-    [[ "$endpoint_mimir" == "null" ]] && endpoint_mimir=""
-    [[ "$endpoint_loki" == "null" ]] && endpoint_loki=""
-    [[ "$endpoint_minio" == "null" ]] && endpoint_minio=""
-  fi
-
-  # --- Compute runtime (launchable) services once so we can reuse them for environment.sh and manifest. ---
-  # Runtime services = services present in catalogue/services.yml with a non-empty .binary.name.
-  local runtime_line
-  runtime_line=""
-
-  {
-    local _svc _exists _bin0
-    for _svc in $(normalize_list "$RESOLVED_SERVICES_RAW"); do
-      _exists="$($YQ_BIN -r ".services.\"${_svc}\" | type" "$services_file" 2>/dev/null || true)"
-      [[ -z "$_exists" || "$_exists" == "null" ]] && continue
-
-      _bin0="$($YQ_BIN -r ".services.\"${_svc}\".binary.name // \"\"" "$services_file" 2>/dev/null || true)"
-      [[ "$_bin0" == "null" ]] && _bin0=""
-      [[ -z "${_bin0//[[:space:]]/}" ]] && continue
-
-      if [[ -z "$runtime_line" ]]; then
-        runtime_line="$_svc"
-      else
-        runtime_line="$runtime_line $_svc"
-      fi
-    done
-  }
-
-  # --- Generate per-release environment file (bash-sourceable; Bash 3 compatible) ---
-  # Only launchable services (services with at least one binary) are included.
-  local env_out
-  env_out="$pkg_dir/bin/environment.sh"
-
-  # Append release-specific exports after the shared runtime environment script.
-  # The shared script provides stable paths and helpers; this block provides context and service mappings.
   {
     echo
     echo "# ------------------------------------------------------------------------------"
     echo "# Release-specific context (auto-generated at build time)"
     echo "# ------------------------------------------------------------------------------"
-
-    # Context
     echo "export SPPMON_APP=\"$APP\""
     echo "export SPPMON_ENV=\"$ENV_NAME\""
-
-    # Endpoints (optional)
-    local em_esc el_esc eni_esc
-    em_esc="${endpoint_mimir//\\/\\\\}"; em_esc="${em_esc//\"/\\\"}"
-    el_esc="${endpoint_loki//\\/\\\\}";  el_esc="${el_esc//\"/\\\"}"
-    eni_esc="${endpoint_minio//\\/\\\\}"; eni_esc="${eni_esc//\"/\\\"}"
-    echo "export SPPMON_ENDPOINT_MIMIR=\"$em_esc\""
-    echo "export SPPMON_ENDPOINT_LOKI=\"$el_esc\""
-    echo "export SPPMON_ENDPOINT_MINIO=\"$eni_esc\""
-
+    echo "export SPPMON_ENDPOINT_MIMIR=\"${em//\"/\\\"}\""
+    echo "export SPPMON_ENDPOINT_LOKI=\"${el//\"/\\\"}\""
+    echo "export SPPMON_ENDPOINT_MINIO=\"${eni//\"/\\\"}\""
     echo
-    echo "# Runtime services (launchable only: services with binaries)"
-
-    local svc safe primary_bin args desc
-
-    for svc in $runtime_line; do
+    for svc in $runtime; do
+      local safe desc args binname
       safe="$(echo "$svc" | sed -E 's/[^A-Za-z0-9_]/_/g')"
-
-      primary_bin="$($YQ_BIN -r ".services.\"$svc\".binary.name // \"\"" "$services_file" 2>/dev/null || true)"
-      [[ "$primary_bin" == "null" ]] && primary_bin=""
-
-      args="$($YQ_BIN -r ".services.\"$svc\".args // \"\"" "$services_file" 2>/dev/null || true)"
-      [[ "$args" == "null" ]] && args=""
-
-      desc="$($YQ_BIN -r ".services.\"$svc\".description // \"\"" "$services_file" 2>/dev/null || true)"
-      [[ "$desc" == "null" ]] && desc=""
-
-      # Escape for bash double-quoted string literals.
-      primary_bin="${primary_bin//\\/\\\\}"; primary_bin="${primary_bin//\"/\\\"}"
-      args="${args//\\/\\\\}";         args="${args//\"/\\\"}"
-      desc="${desc//\\/\\\\}";         desc="${desc//\"/\\\"}"
-
-      # Emit mappings (only for runtime services; runtime_line already filters for a binary)
-      echo "export SPPMON_BIN__${safe}=\"${primary_bin}\""
-      echo "export SPPMON_ARGS__${safe}=\"${args}\""
-      echo "export SPPMON_DESC__${safe}=\"${desc}\""
+      binname="$(svc_bin_name "$svc")"
+      args="$(svc_args "$svc")"
+      desc="$(svc_desc "$svc")"
+      echo "export SPPMON_BIN__${safe}=\"${binname//\"/\\\"}\""
+      echo "export SPPMON_ARGS__${safe}=\"${args//\"/\\\"}\""
+      echo "export SPPMON_DESC__${safe}=\"${desc//\"/\\\"}\""
     done
-
     echo
-    echo "export SPPMON_RUNTIME_SERVICES=\"${runtime_line}\""
-  } >> "$env_out"
+    echo "export SPPMON_RUNTIME_SERVICES=\"$runtime\""
+  } >> "$pkg/bin/environment.sh"
 
-  chmod +x "$env_out" 2>/dev/null || true
-
-  # Metadata (human-readable)
-  # Keep it small but useful for operators: runtime services + fragments.
-  local manifest_out
-  manifest_out="$pkg_dir/meta/manifest.txt"
-
+  # manifest (compact + readable)
   {
     echo "Release"
-    echo "  id: $release_id"
+    echo "  id: $rid"
     echo "  built_at: $ts_human"
     echo
     echo "Context"
     echo "  app: $APP"
     echo "  env: $ENV_NAME"
     echo
-
     echo "Services"
-    # List runtime services only (launchable = has binaries)
-    local svc desc
-    for svc in $runtime_line; do
-      desc="$($YQ_BIN -r ".services.\"$svc\".description // \"\"" "$services_file" 2>/dev/null || true)"
-      [[ "$desc" == "null" ]] && desc=""
-      echo "$svc: $desc"
-      local line
-      line="$(yq_read_service_binary "$svc")"
-      if [[ -n "$line" ]]; then
-        bin_name="${line%%|*}"
-        bin_version="${line#*|}"
-        echo "  binary: ${bin_name}@${bin_version}"
-      fi
+    for svc in $runtime; do
+      echo "$svc: $(svc_desc "$svc")"
     done
     echo
     echo "Fragments"
-    if [[ -n "${fragments_ordered//[[:space:]]/}" ]]; then
-      local f
-      for f in $fragments_ordered; do
-        echo "  - $f"
-      done
-    else
-      echo "  - (none)"
-    fi
-  } > "$manifest_out"
+    for f in $frags; do
+      echo "  - $f"
+    done
+  } > "$pkg/meta/manifest.txt"
 
-  tarball="$dist_dir/${release_id}.tar.gz"
-  # IMPORTANT: use -C to guarantee the tarball contains only relative paths
-  tar -czf "$tarball" -C "$work_dir" "$release_id"
-  log "Release packaged: $tarball"
-  # Return values via stdout (safe because logs are stderr)
-  printf '%s|%s|%s\n' "$release_id" "$tarball" "$work_dir"
+  tar="$dist/$rid.tar.gz"
+  tar -czf "$tar" -C "$work" "$rid"
+
+  log "Release packaged: $tar"
+  printf '%s|%s|%s\n' "$rid" "$tar" "$work"
 }
 
-# ---- Helpers for deploy layout and catalogue ---------------------------------
+# -------- remote deploy --------
 
-normalize_remote_base_rel() {
-  # Remote base directory relative to the remote login directory.
-  # Accepts either "SPP_Monitoring" or "/SPP_Monitoring"; returns the relative form.
-  local b="${SPPMON_REMOTE_BASE:-$DEFAULT_REMOTE_BASE}"
-  b="${b%/}"
-  b="${b#/}"
-  [[ -n "${b//[[:space:]]/}" ]] || die "Remote base directory is empty (SPPMON_REMOTE_BASE/DEFAULT_REMOTE_BASE)"
+remote_base() {
+  local b="${SPPMON_REMOTE_BASE:-$REMOTE_BASE_DEFAULT}"
+  b="${b%/}"; b="${b#/}"
+  [[ -n "${b//[[:space:]]/}" ]] || die "Remote base is empty"
   echo "$b"
 }
 
+deploy_one() {
+  local host="$1" rid="$2" tar="$3"
+  local base rel vol cur tmp dest
 
-# ---- Remote deployment -------------------------------------------------------
+  base="$(remote_base)"
+  rel="$base/releases"
+  vol="$base/volumes"
+  cur="$base/current"
+  tmp="/tmp/$rid.tar.gz"
+  dest="$TENANT@$host"
 
-deploy_remote_host() {
-  local target_name="$1"
-  local release_id="$2"
-  local tarball="$3"
+  log "Deploying: $host:$base"
 
-  # ---- Initialize connection + layout (remote) ------------------------------
-  local ssh_user remote_dest remote_host
-  local base releases volumes current
-  local remote_tmp
+  ssh $SSH_OPTS "$dest" "mkdir -p '$rel' '$vol/data' '$vol/logs' '$vol/run'" || die "SSH mkdir failed: $host"
+  scp $SSH_OPTS "$tar" "$dest:$tmp" || die "SCP failed: $host"
 
-  ssh_user="$TENANT"
-  [[ -n "${ssh_user//[[:space:]]/}" ]] || die "Remote deploy requires TENANT (SSH user) resolved from catalogue/apps.yml"
-
-  remote_host="$target_name"
-
-  ssh_user="jean"
-  remote_dest="$ssh_user@$target_name"
-
-  base="$(normalize_remote_base_rel)"
-  releases="$base/releases"
-  volumes="$base/volumes"
-  current="$base/current"
-
-  remote_tmp="/tmp/${release_id}.tar.gz"
-
-  log "Deploying (remote) into: ${remote_host}:${base} (relative to login dir)"
-
-  # ---- Actions ---------------------------------------------------------------
-  ssh $SSH_OPTS "$remote_dest" "mkdir -p '$releases' '$volumes/data' '$volumes/logs' '$volumes/run'" \
-    || die "SSH mkdir failed on $remote_host"
-
-  scp $SSH_OPTS "$tarball" "$remote_dest:$remote_tmp" \
-    || die "SCP upload failed to $remote_host:$remote_tmp"
-
-  ssh $SSH_OPTS "$remote_dest" bash -s -- \
-    "$release_id" "$remote_tmp" "$releases" "$current" <<'REMOTE_SH'
+  ssh $SSH_OPTS "$dest" bash -s -- "$rid" "$tmp" "$rel" <<'REMOTE'
 set -euo pipefail
-
-release_id="$1"
-remote_tmp="$2"
-releases="$3"
-current="$4"
-
-# Base directory is the parent of the releases/ directory.
-base_dir="$(dirname "$releases")"
-
-staging="$releases/.staging_${release_id}"
-new_release="$releases/$release_id"
+rid="$1"; tmp="$2"; rel="$3"
+base_dir="$(dirname "$rel")"
+staging="$rel/.staging_${rid}"
+new="$rel/$rid"
 
 rm -rf "$staging"
 mkdir -p "$staging"
+trap 'rm -rf "$staging" 2>/dev/null || true' ERR
 
-cleanup() {
-  rm -rf "$staging" 2>/dev/null || true
-}
-trap cleanup ERR
+tar -xzf "$tmp" -C "$staging"
+[[ -d "$staging/$rid" ]] || { echo "ERROR: extract failed" >&2; exit 1; }
 
-# Extract
- tar -xzf "$remote_tmp" -C "$staging"
-
-# Validate
-if [[ ! -d "$staging/$release_id" ]]; then
-  echo "ERROR: Extract failed; '$staging/$release_id' not found" >&2
-  exit 1
-fi
-
-# Move into place
-rm -rf "$new_release"
-mv "$staging/$release_id" "$new_release"
-
+rm -rf "$new"
+mv "$staging/$rid" "$new"
 rm -rf "$staging"
 trap - ERR
 
-# Switch current symlink only after successful install.
-# IMPORTANT: create the symlink target relative to base_dir to avoid nesting paths like
-# "SPP_Monitoring/current -> SPP_Monitoring/releases/..." which resolves incorrectly.
-ln -sfn "releases/$release_id" "$base_dir/current"
+# current symlink must be relative to <BASE>
+ln -sfn "releases/$rid" "$base_dir/current"
 
-# Write Prometheus textfile catalogue
-catalogue_file="$releases/version_present.prom"
-current_basename="$(basename "$(readlink "$base_dir/current")")"
-
+# prom catalogue
+releases_dir="$rel"
+cur_id="$(basename "$(readlink "$base_dir/current")")"
 {
-  echo "# HELP sppmon_release Release catalogue (1 = present on disk). Label current=\"true\" marks the active release."
+  echo "# HELP sppmon_release Release catalogue (1 = present). current=\"true\" for active release."
   echo "# TYPE sppmon_release gauge"
-
-  for d in "$releases"/*; do
+  for d in "$releases_dir"/*; do
     [[ -d "$d" ]] || continue
     [[ "$(basename "$d")" == .* ]] && continue
-
-    if [[ "$(basename "$d")" == "$current_basename" ]]; then
+    if [[ "$(basename "$d")" == "$cur_id" ]]; then
       echo "sppmon_release{release=\"$(basename "$d")\",current=\"true\"} 1"
     else
       echo "sppmon_release{release=\"$(basename "$d")\",current=\"false\"} 1"
     fi
   done
-} > "$catalogue_file"
+} > "$releases_dir/version_present.prom"
 
-# Cleanup uploaded tarball
-rm -f "$remote_tmp" 2>/dev/null || true
-REMOTE_SH
+rm -f "$tmp" 2>/dev/null || true
+REMOTE
 
-  log "OK (remote): current -> ${releases}/$(basename "${release_id}")"
+  log "OK: $host current -> $rid"
 }
 
-# ---- Main --------------------------------------------------------------------
-
 main() {
-  parse_args "$@"
-  validate_args
+  parse "$@"
+  init
 
-  detect_yq
-
-  if [[ -z "${SERVICES_RAW:-}" ]]; then
-    log "No --services provided; using defaults from catalogue/apps.yml for app '$APP'."
-    load_default_services_for_app
-    log "Resolved default services: $SERVICES_RAW"
+  # services
+  if [[ -z "${SERVICES_RAW//[[:space:]]/}" ]]; then
+    SERVICES_RAW="$(app_defaults_csv)"
+    [[ -n "${SERVICES_RAW//[[:space:]]/}" ]] || die "No default services for app '$APP' (apps.yml: apps.<APP>.defaults.services)"
+    log "Using default services: $SERVICES_RAW"
   fi
 
-  load_tenant_for_app
+  parse_services "$SERVICES_RAW"
 
-  # Parse services and versions, then expand transitive dependencies (requires) before building the release.
-  parse_services_and_versions
-  RESOLVED_SERVICES_RAW="$(resolve_services_with_requires "$SERVICES_STRIPPED_RAW")"
-  log "Resolved services (with requires): $RESOLVED_SERVICES_RAW"
+  # expand requires
+  EXPANDED_SERVICES="$(expand_services)"
+  log "Services: $EXPANDED_SERVICES"
 
-  local result release_id tarball work_dir
-  result="$(build_release)"
-  release_id="${result%%|*}"
-  tarball="${result#*|}"; tarball="${tarball%%|*}"
-  work_dir="${result##*|}"
+  local out rid tar work
+  out="$(build_release)"
+  rid="${out%%|*}"
+  tar="${out#*|}"; tar="${tar%%|*}"
+  work="${out##*|}"
 
   local host
   for host in $(normalize_list "$TARGETS_RAW"); do
-    log "Deploy target: $host"
-    deploy_remote_host "$host" "$release_id" "$tarball"
+    deploy_one "$host" "$rid" "$tar"
   done
-  rm -rf "$work_dir"
-  log "Deploy completed for release: $release_id"
+
+  rm -rf "$work"
+  log "Deploy completed: $rid"
 }
 
 main "$@"

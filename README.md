@@ -1,0 +1,1 @@
+Mettre la version du binaire lors du lancement.

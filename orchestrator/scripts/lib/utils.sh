@@ -76,3 +76,35 @@ get_arg_value() {
   done
   echo "$val"
 }
+
+get_tenant() {
+  local app="$1"
+  local env="$2"
+
+  [[ -n "$app" && -n "$env" ]] || die "Cannot resolve tenant: app or env missing"
+
+  local tenant
+  tenant="$($ROOT_DIR/tools/yq -r ".apps.${app}.tenants.${env}" "$ROOT_DIR/catalogue/apps.yml")"
+
+  [[ -n "$tenant" && "$tenant" != "null" ]] \
+    || die "No tenant defined for app='$app' env='$env' in apps.yml"
+
+  echo "$tenant"
+}
+
+remote_control() {
+  # Usage: remote_control_current <tenant> <target> [control_args...]
+  local tenant="$1"; shift
+  local target="$1"; shift
+  local base="${SPPMON_REMOTE_BASE:-SPP_Monitoring}"
+
+  # Build a safely-quoted command line for the remote shell.
+  local -a q=()
+  local a
+  for a in "$@"; do
+    q+=("$(printf '%q' "$a")")
+  done
+
+  ssh -o StrictHostKeyChecking=no "${tenant}@${target}" \
+    "cd $(printf '%q' "$base") && ./current/bin/control.sh ${q[*]}"
+}

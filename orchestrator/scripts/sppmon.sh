@@ -4,7 +4,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# shellcheck source=lib/utils.sh
 source "$SCRIPT_DIR/lib/utils.sh"
 
 print_help() {
@@ -25,11 +24,14 @@ GLOBAL OPTIONS:
   --use-marley         Resolve targets using Marley (can be placed anywhere).
   --help, -h           Show this help.
 
+  In Marley mode, --app, --env, and --targets are mandatory. Use 'all'/'--all' to disable filters.
+
 FILTERS (used with --use-marley or direct targeting):
   --app <name>         Application name (e.g., ICOM, Jaguar)
   --env <name>         Environment name (e.g., UAT, PRD)
-  --targets <list>     Comma-separated targets or a Marley FQDN filter.
-                       Required without --use-marley, optional with it.
+  --targets <value>    Marley FQDN filter or comma-separated targets.
+                       Use '--all' to disable this filter (Marley mode).
+                       Required in Marley mode and non-Marley mode.
   --os <name>          OS filter for Marley (optional)
 
 DEPLOY OPTIONS:
@@ -87,6 +89,25 @@ case "$cmd" in
   *) die "Unknown command: $cmd (use --help)" ;;
 esac
 
+has_flag() {
+  local key="$1"; shift
+  local a
+  for a in "$@"; do
+    [[ "$a" == "$key" ]] && return 0
+  done
+  return 1
+}
+
+normalize_filter() {
+  # Accept "all" or "--all" as a special value meaning: disable the filter.
+  local v="${1:-}"
+  if [[ "$v" == "all" || "$v" == "--all" ]]; then
+    echo ""
+  else
+    echo "$v"
+  fi
+}
+
 # Helper: remove our routing flags so we can forward the rest as-is.
 # Keeps the code readable and avoids duplication.
 forward_args=()
@@ -119,7 +140,7 @@ if [[ $use_marley -eq 0 ]]; then
 
   [[ -n "$app" ]] || die "--app is required"
   [[ -n "$env" ]] || die "--env is required"
-  [[ -n "$targets" ]] || die "--targets is required unless --use-marley is specified"
+  [[ -n "$targets" ]] || die "--targets is required"
 
   #tenant="$(get_tenant "$app" "$env")"
   tenant="jean"
@@ -153,10 +174,16 @@ if [[ $use_marley -eq 0 ]]; then
 else
   log "Using marley inventory"
 
-  app="$(get_arg_value --app)"
-  env="$(get_arg_value --env)"
-  targets="$(get_arg_value --targets)"
-  os="$(get_arg_value --os)"
+  # Marley mode requires explicit filters flags to be present.
+  # Use values "all" or "--all" to disable a given filter.
+  has_flag --app "${argv[@]:1}"     || die "Marley mode: --app is required (use 'all' to disable the filter)"
+  has_flag --env "${argv[@]:1}"     || die "Marley mode: --env is required (use 'all' to disable the filter)"
+  has_flag --targets "${argv[@]:1}" || die "Marley mode: --targets is required (use 'all' to disable the filter)"
+
+  app="$(normalize_filter "$(get_arg_value --app)")"
+  env="$(normalize_filter "$(get_arg_value --env)")"
+  targets="$(normalize_filter "$(get_arg_value --targets)")"
+  os="$(normalize_filter "$(get_arg_value --os)")"
 
   marley_query "$app" "$env" "$targets" "$os" \
     | tail -n +2 \

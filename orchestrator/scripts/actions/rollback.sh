@@ -6,12 +6,12 @@ LIB_DIR="$(cd "$SCRIPT_DIR/../lib" && pwd)"
 
 # shellcheck source=../lib/utils.sh
 source "$LIB_DIR/utils.sh"
-
 # -----------------------------------------------------------------------------
 # rollback.sh
 # Switch the active release on remote targets (via SSH) by updating the
 # `current` symlink under the remote base directory.
 # -----------------------------------------------------------------------------
+
 
 DEFAULT_REMOTE_BASE="SPP_Monitoring"
 

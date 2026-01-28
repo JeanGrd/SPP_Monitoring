@@ -1,11 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Simplified, strict-by-default remote deploy.
-# - Builds a release tarball locally.
-# - Uploads and installs it on remote targets.
-# - Switches <base>/current -> releases/<release_id>
-
 # shellcheck disable=SC2164
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIB_DIR="$(cd "$SCRIPT_DIR/../lib" && pwd)"
